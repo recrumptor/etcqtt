@@ -137,11 +137,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # rust-client требует rust >= 1.97.1 (edition 2024)
-      - name: Rust stable
+      # rust-client требует rust >= 1.97.1 (edition 2024); фиксируем версию для воспроизводимости
+      - name: Rust 1.97.1
         if: ${{ !matrix.nightly }}
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.rust_target }}
 
       - name: Rust nightly (build-std, Tier 3)
@@ -153,13 +154,12 @@ jobs:
       - name: Host dependencies (cmake, perl for aws-lc-rs)
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build perl xz-utils upx-ucl
 
-      - name: zig + cargo-zigbuild
-        run: |
-          ZIG_VER=0.14.1
-          curl -fLO "https://ziglang.org/download/${ZIG_VER}/zig-linux-x86_64-${ZIG_VER}.tar.xz"
-          tar -xf "zig-linux-x86_64-${ZIG_VER}.tar.xz"
-          echo "$PWD/zig-linux-x86_64-${ZIG_VER}" >> "$GITHUB_PATH"
-          cargo install cargo-zigbuild --locked
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -177,7 +177,7 @@ jobs:
         run: |
           STD=""; [ "${{ matrix.nightly }}" = "true" ] && STD="-Zbuild-std"
           cd source/rust-client
-          cargo zigbuild --release --target ${{ matrix.rust_target }} $STD
+          cargo zigbuild --release --locked --target ${{ matrix.rust_target }} $STD
           mkdir -p ../../out
           cp "target/${{ matrix.rust_target }}/release/client" ../../out/csqtt-core
 
