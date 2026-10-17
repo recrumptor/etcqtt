@@ -1,0 +1,7 @@
+wrapper/target/
+csqtt/files/usr/bin/csqtt
+csqtt/files/usr/libexec/csqtt/csqtt-core
+out/
+sdk/
+*.ipk
+*.apk

@@ -1,0 +1,417 @@
+name: Build CSQTT OpenWrt
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      test_build:
+        description: 'Тестовая сборка (без публикации релиза)'
+        type: boolean
+        default: false
+      core_ref:
+        description: 'Тег/ветка ядра upstream (пусто = последний релиз)'
+        type: string
+        default: ''
+  schedule:
+    - cron: '14 1 * * 5'
+
+env:
+  CORE_REPO: amurcanov/csqtt
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Тесты обёртки: unit + сквозной тест службы с поддельным ядром (нужен root/TUN)
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wrapper
+      - name: Unit tests
+        run: cd wrapper && cargo test --locked --release
+      - name: Build wrapper (host)
+        run: cd wrapper && cargo build --locked --release
+      - name: Integration test (service + TUN + failover + CAPTCHA flow)
+        run: |
+          sudo modprobe tun || true
+          sudo test -c /dev/net/tun
+          sudo python3 tests/integration.py
+
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      ver: ${{ steps.get_ver.outputs.ver }}
+      core_ref: ${{ steps.get_ver.outputs.core_ref }}
+      rel: ${{ steps.get_rel.outputs.rel }}
+      tag: ${{ steps.get_rel.outputs.tag }}
+      exists: ${{ steps.check.outputs.exists }}
+      luci_ver: ${{ steps.luci_ver.outputs.luci_ver }}
+      luci_exists: ${{ steps.check_luci.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get core version (upstream)
+        id: get_ver
+        run: |
+          REF="${{ inputs.core_ref }}"
+          if [ -n "$REF" ]; then
+            VER="${REF#v}"
+          else
+            VER=$(curl -fs -o /dev/null -w %{redirect_url} https://github.com/${CORE_REPO}/releases/latest | cut -d '/' -f8 | sed 's/^v//')
+            [ -z "$VER" ] && VER="2.1.9"
+            REF="v$VER"
+          fi
+          echo "ver=$VER" >> $GITHUB_OUTPUT
+          echo "core_ref=$REF" >> $GITHUB_OUTPUT
+
+      - name: Package release (csqtt/Makefile)
+        id: get_rel
+        run: |
+          R=$(sed -n 's/^PKG_RELEASE[[:space:]]*:=[[:space:]]*//p' csqtt/Makefile | head -n1 | tr -d '[:space:]\r')
+          [ -z "$R" ] && R=1
+          echo "rel=$R" >> $GITHUB_OUTPUT
+          echo "tag=v${{ steps.get_ver.outputs.ver }}-r${R}" >> $GITHUB_OUTPUT
+
+      - name: Check release (csqtt)
+        id: check
+        run: |
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.get_rel.outputs.tag }})
+          echo "exists=$([ "$HTTP_STATUS" -eq 200 ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
+      - name: LuCI version from Makefile
+        id: luci_ver
+        run: |
+          MK=luci-app-csqtt/Makefile
+          V=$(sed -n 's/^PKG_VERSION[[:space:]]*:=[[:space:]]*//p' "$MK" | head -n1 | tr -d '[:space:]\r')
+          R=$(sed -n 's/^PKG_RELEASE[[:space:]]*:=[[:space:]]*//p' "$MK" | head -n1 | tr -d '[:space:]\r')
+          [ -z "$V" ] && exit 1
+          [ -z "$R" ] && R=1
+          echo "luci_ver=${V}-r${R}" >> $GITHUB_OUTPUT
+
+      - name: Check release (luci-app-csqtt)
+        id: check_luci
+        run: |
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/releases/tags/luci-v${{ steps.luci_ver.outputs.luci_ver }})
+          echo "exists=$([ "$HTTP_STATUS" -eq 200 ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Бинарники: ядро upstream (client) + обёртка (csqtt) — кросс-сборка cargo-zigbuild.
+  # Один набор на rust-target; используется обеими ветками OpenWrt.
+  # mipsel — Tier 3 в Rust (nightly + build-std), у upstream такой цели нет → experimental.
+  # ---------------------------------------------------------------------------
+  build-bin:
+    name: bin (${{ matrix.rust_target }})
+    needs: [test, check-version]
+    if: needs.check-version.outputs.exists == 'false' || inputs.test_build || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: x86_64-unknown-linux-musl
+            nightly: false
+            experimental: false
+            upx: false
+          - rust_target: aarch64-unknown-linux-musl
+            nightly: false
+            experimental: false
+            upx: false
+          - rust_target: armv7-unknown-linux-musleabihf
+            nightly: false
+            experimental: true
+            upx: false
+          - rust_target: mipsel-unknown-linux-musl
+            nightly: true
+            experimental: true
+            upx: true
+    steps:
+      - uses: actions/checkout@v6
+
+      # rust-client требует rust >= 1.97.1 (edition 2024)
+      - name: Rust stable
+        if: ${{ !matrix.nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Rust nightly (build-std, Tier 3)
+        if: ${{ matrix.nightly }}
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Host dependencies (cmake, perl for aws-lc-rs)
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build perl xz-utils upx-ucl
+
+      - name: zig + cargo-zigbuild
+        run: |
+          ZIG_VER=0.14.1
+          curl -fLO "https://ziglang.org/download/${ZIG_VER}/zig-linux-x86_64-${ZIG_VER}.tar.xz"
+          tar -xf "zig-linux-x86_64-${ZIG_VER}.tar.xz"
+          echo "$PWD/zig-linux-x86_64-${ZIG_VER}" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust_target }}
+          workspaces: |
+            wrapper
+            source/rust-client
+
+      - name: Clone core source
+        run: |
+          git clone --depth 1 --branch "${{ needs.check-version.outputs.core_ref }}" \
+            https://github.com/${CORE_REPO}.git source
+
+      - name: Compile core (client)
+        run: |
+          STD=""; [ "${{ matrix.nightly }}" = "true" ] && STD="-Zbuild-std"
+          cd source/rust-client
+          cargo zigbuild --release --target ${{ matrix.rust_target }} $STD
+          mkdir -p ../../out
+          cp "target/${{ matrix.rust_target }}/release/client" ../../out/csqtt-core
+
+      - name: Compile wrapper (csqtt)
+        run: |
+          STD=""; [ "${{ matrix.nightly }}" = "true" ] && STD="-Zbuild-std=std,panic_abort"
+          cd wrapper
+          CSQTT_CORE_VERSION="${{ needs.check-version.outputs.ver }}" \
+            cargo zigbuild --release --locked --target ${{ matrix.rust_target }} $STD
+          cp "target/${{ matrix.rust_target }}/release/csqtt" ../out/csqtt
+
+      - name: UPX
+        if: ${{ matrix.upx }}
+        run: |
+          ls -l out
+          upx --best --lzma out/csqtt out/csqtt-core
+          upx -t out/csqtt out/csqtt-core
+          ls -l out
+
+      - name: Smoke test (x86_64)
+        if: ${{ matrix.rust_target == 'x86_64-unknown-linux-musl' }}
+        run: |
+          file out/csqtt out/csqtt-core
+          ./out/csqtt version
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.rust_target }}
+          path: out/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Пакеты csqtt (.ipk для 24.10, .apk для 25.12) через OpenWrt SDK
+  # ---------------------------------------------------------------------------
+  package:
+    name: pkg (${{ matrix.openwrt_ver }}, ${{ matrix.pkg_arch }})
+    needs: [check-version, build-bin]
+    if: ${{ !cancelled() && (needs.check-version.outputs.exists == 'false' || inputs.test_build) && needs.build-bin.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { openwrt_ver: "24.10", pkg_ext: ipk, pkg_arch: x86_64,            target_name: "x86/64",            rust_target: x86_64-unknown-linux-musl,        experimental: false }
+          - { openwrt_ver: "24.10", pkg_ext: ipk, pkg_arch: aarch64_cortex-a53, target_name: "mediatek/filogic", rust_target: aarch64-unknown-linux-musl,       experimental: false }
+          - { openwrt_ver: "24.10", pkg_ext: ipk, pkg_arch: arm_cortex-a7_neon-vfpv4, target_name: "ipq40xx/generic", rust_target: armv7-unknown-linux-musleabihf, experimental: true }
+          - { openwrt_ver: "24.10", pkg_ext: ipk, pkg_arch: mipsel_24kc,        target_name: "ramips/mt7621",    rust_target: mipsel-unknown-linux-musl,        experimental: true }
+          - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: x86_64,            target_name: "x86/64",            rust_target: x86_64-unknown-linux-musl,        experimental: false }
+          - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: aarch64_cortex-a53, target_name: "mediatek/filogic", rust_target: aarch64-unknown-linux-musl,       experimental: false }
+          - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: arm_cortex-a7_neon-vfpv4, target_name: "ipq40xx/generic", rust_target: armv7-unknown-linux-musleabihf, experimental: true }
+          - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: mipsel_24kc,        target_name: "ramips/mt7621",    rust_target: mipsel-unknown-linux-musl,        experimental: true }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: bins-${{ matrix.rust_target }}
+          path: bins
+
+      - name: Install packaging dependencies
+        run: sudo apt-get update && sudo apt-get install -y libncurses5-dev zstd xz-utils
+
+      - name: Resolve OpenWrt version & SDK URL
+        id: sdk
+        run: |
+          BRANCH="${{ matrix.openwrt_ver }}"
+          FULL_VER=$(curl -s "https://downloads.openwrt.org/releases/" \
+            | grep -oE "${BRANCH//./\\.}\.[0-9]+" | sort -V | uniq | tail -1)
+          [ -z "$FULL_VER" ] && exit 1
+          echo "OpenWrt $BRANCH -> $FULL_VER"
+          BASE_URL="https://downloads.openwrt.org/releases/$FULL_VER/targets/${{ matrix.target_name }}"
+          SDK_FILENAME=$(curl -s "$BASE_URL/" \
+            | grep -o 'href="[^"]*openwrt-sdk-[^"]*\.tar\.\(zst\|xz\)"' \
+            | sed 's/href="//;s/"$//' | head -1)
+          [ -z "$SDK_FILENAME" ] && exit 1
+          echo "sdk_url=$BASE_URL/$SDK_FILENAME" >> $GITHUB_OUTPUT
+          echo "sdk_filename=$SDK_FILENAME" >> $GITHUB_OUTPUT
+
+      - name: Setup SDK
+        run: |
+          wget -q -O sdk.archive "${{ steps.sdk.outputs.sdk_url }}"
+          mkdir sdk
+          if [[ "${{ steps.sdk.outputs.sdk_filename }}" == *.tar.zst ]]; then
+            tar --use-compress-program=unzstd -xf sdk.archive -C sdk --strip-components=1
+          else
+            tar -xJf sdk.archive -C sdk --strip-components=1
+          fi
+
+      - name: Prepare package
+        run: |
+          install -D -m0755 bins/csqtt      csqtt/files/usr/bin/csqtt
+          install -D -m0755 bins/csqtt-core csqtt/files/usr/libexec/csqtt/csqtt-core
+          sed -i "s/^PKG_VERSION:=.*$/PKG_VERSION:=${{ needs.check-version.outputs.ver }}/" csqtt/Makefile
+          cp -r csqtt sdk/package/
+
+      - name: Compile package
+        run: |
+          cd sdk
+          make defconfig
+          echo "CONFIG_PACKAGE_csqtt=m" >> .config
+          make defconfig
+          make package/csqtt/compile V=s -j$(nproc)
+          mkdir -p ../output-artifacts
+          OUT="csqtt-${{ needs.check-version.outputs.ver }}-r${{ needs.check-version.outputs.rel }}-${{ matrix.pkg_arch }}-v${{ matrix.openwrt_ver }}.${{ matrix.pkg_ext }}"
+          F=$(find bin/ -name "csqtt[_-]*.${{ matrix.pkg_ext }}" | head -n1)
+          [ -n "$F" ] || { echo "пакет не найден"; exit 1; }
+          cp "$F" "../output-artifacts/$OUT"
+          ls -l ../output-artifacts
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: csqtt-${{ matrix.pkg_arch }}-v${{ matrix.openwrt_ver }}
+          path: output-artifacts/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # luci-app-csqtt + luci-i18n-csqtt-ru (PKGARCH:=all — один таргет на ветку)
+  # ---------------------------------------------------------------------------
+  build-luci:
+    name: luci (${{ matrix.openwrt_ver }})
+    needs: check-version
+    if: needs.check-version.outputs.luci_exists == 'false' || inputs.test_build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { openwrt_ver: "24.10", pkg_ext: ipk, target_name: "ramips/mt7621" }
+          - { openwrt_ver: "25.12", pkg_ext: apk, target_name: "ramips/mt7621" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libncurses5-dev zstd xz-utils
+
+      - name: Resolve OpenWrt version & SDK URL
+        id: sdk
+        run: |
+          BRANCH="${{ matrix.openwrt_ver }}"
+          FULL_VER=$(curl -s "https://downloads.openwrt.org/releases/" \
+            | grep -oE "${BRANCH//./\\.}\.[0-9]+" | sort -V | uniq | tail -1)
+          [ -z "$FULL_VER" ] && exit 1
+          BASE_URL="https://downloads.openwrt.org/releases/$FULL_VER/targets/${{ matrix.target_name }}"
+          SDK_FILENAME=$(curl -s "$BASE_URL/" \
+            | grep -o 'href="[^"]*openwrt-sdk-[^"]*\.tar\.\(zst\|xz\)"' \
+            | sed 's/href="//;s/"$//' | head -1)
+          [ -z "$SDK_FILENAME" ] && exit 1
+          echo "sdk_url=$BASE_URL/$SDK_FILENAME" >> $GITHUB_OUTPUT
+          echo "sdk_filename=$SDK_FILENAME" >> $GITHUB_OUTPUT
+
+      - name: Setup SDK
+        run: |
+          wget -q -O sdk.archive "${{ steps.sdk.outputs.sdk_url }}"
+          mkdir sdk
+          if [[ "${{ steps.sdk.outputs.sdk_filename }}" == *.tar.zst ]]; then
+            tar --use-compress-program=unzstd -xf sdk.archive -C sdk --strip-components=1
+          else
+            tar -xJf sdk.archive -C sdk --strip-components=1
+          fi
+
+      - name: Prepare packages
+        run: |
+          # csqtt нужен в дереве только для разрешения зависимости +csqtt (не компилируется)
+          : > csqtt/files/usr/bin/csqtt
+          : > csqtt/files/usr/libexec/csqtt/csqtt-core
+          cp -r csqtt luci-app-csqtt luci-i18n-csqtt-ru sdk/package/
+
+      - name: Compile packages
+        run: |
+          cd sdk
+          make defconfig
+          echo "CONFIG_PACKAGE_luci-app-csqtt=m" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-csqtt-ru=m" >> .config
+          make defconfig
+          make package/luci-app-csqtt/compile V=s -j$(nproc)
+          make package/luci-i18n-csqtt-ru/compile V=s -j$(nproc)
+          mkdir -p ../luci-artifacts
+          find bin/ \( -name "luci-app-csqtt[_-]*.${{ matrix.pkg_ext }}" -o -name "luci-i18n-csqtt-ru[_-]*.${{ matrix.pkg_ext }}" \) \
+            -exec cp {} ../luci-artifacts/ \;
+          ls ../luci-artifacts/luci-app-csqtt-*.${{ matrix.pkg_ext }} >/dev/null 2>&1 || ls ../luci-artifacts/luci-app-csqtt_*.${{ matrix.pkg_ext }} >/dev/null 2>&1
+          ls ../luci-artifacts/luci-i18n-csqtt-ru[_-]*.${{ matrix.pkg_ext }} >/dev/null 2>&1
+
+      - name: Upload LuCI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-csqtt-v${{ matrix.openwrt_ver }}
+          path: luci-artifacts/
+          if-no-files-found: error
+
+  publish:
+    needs: [test, check-version, package, build-luci]
+    if: ${{ !inputs.test_build && github.event_name != 'pull_request' && !cancelled() && needs.test.result == 'success' && needs.check-version.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Verify required packages
+        if: needs.package.result != 'skipped'
+        run: |
+          ls -R artifacts | head -50
+          for v in 24.10 25.12; do
+            for a in x86_64 aarch64_cortex-a53; do
+              ls artifacts/csqtt-$a-v$v/csqtt-*-$a-v$v.* >/dev/null || { echo "нет обязательного пакета $a / $v"; exit 1; }
+            done
+          done
+
+      - name: Publish release (csqtt)
+        if: needs.package.result != 'skipped'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.check-version.outputs.tag }}
+          name: "csqtt v${{ needs.check-version.outputs.ver }}-r${{ needs.check-version.outputs.rel }} (core ${{ needs.check-version.outputs.ver }})"
+          files: |
+            artifacts/csqtt-*/*.ipk
+            artifacts/csqtt-*/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish release (luci-app-csqtt)
+        if: needs.build-luci.result == 'success'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: luci-v${{ needs.check-version.outputs.luci_ver }}
+          name: "luci-app-csqtt v${{ needs.check-version.outputs.luci_ver }}"
+          make_latest: false
+          files: |
+            artifacts/luci-csqtt-*/*.ipk
+            artifacts/luci-csqtt-*/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
