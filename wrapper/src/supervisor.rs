@@ -501,7 +501,9 @@ impl Sup {
                 loge!("{}", m);
                 self.mark_failed(id, &m, "failed");
                 self.last_error = m;
-                self.retry_at = Instant::now() + Duration::from_secs(self.set.reconnect_delay);
+                let fails = self.pool.iter().find(|p| p.id == id).map(|p| p.fails).unwrap_or(1);
+                // нарастающая пауза, чтобы не долбить запуск каждую секунду
+                self.retry_at = Instant::now() + Duration::from_secs((self.set.reconnect_delay << fails.min(5)).min(300));
                 return;
             }
         };

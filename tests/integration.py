@@ -67,7 +67,12 @@ def check(cond, msg):
         print("FAIL", msg); dump(); sys.exit(1)
     ok(msg)
 
-env = dict(os.environ, CSQTT_CORE=f"{HERE}/fake_core.py", FAKE_LOG=flog, TUN_NAME="csqtt_it0")
+# Копируем заглушку во временный каталог с правами 0755: бит исполнения в репозитории
+# может потеряться (загрузка через веб-интерфейс GitHub, распаковка zip).
+FAKE = f"{d}/fake_core.py"
+shutil.copyfile(f"{HERE}/fake_core.py", FAKE)
+os.chmod(FAKE, 0o755)
+env = dict(os.environ, CSQTT_CORE=FAKE, FAKE_LOG=flog, TUN_NAME="csqtt_it0")
 proc = None
 def start():
     global proc
