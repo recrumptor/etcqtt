@@ -187,11 +187,21 @@ jobs:
             echo "::warning::patches/core-musl-udp-batch.patch не применяется к ${{ needs.check-version.outputs.core_ref }} — собираем без него (возможна ошибка компиляции под musl)"
           fi
 
+      # mips32 не имеет 64-битных атомиков в std (AtomicU64/AtomicI64) — подменяем на portable-atomic.
+      - name: Patch core for 64-bit atomics (mips32)
+        if: ${{ matrix.rust_target == 'mipsel-unknown-linux-musl' }}
+        run: |
+          cd source/rust-client
+          python3 "$GITHUB_WORKSPACE/patches/core-mips32-atomic64.py"
+          cargo add portable-atomic@1
+
       - name: Compile core (client)
         run: |
           STD=""; [ "${{ matrix.nightly }}" = "true" ] && STD="-Zbuild-std"
+          # для mipsel добавлена зависимость portable-atomic → Cargo.lock меняется, --locked нельзя
+          LOCK="--locked"; [ "${{ matrix.rust_target }}" = "mipsel-unknown-linux-musl" ] && LOCK=""
           cd source/rust-client
-          cargo zigbuild --release --locked --target ${{ matrix.rust_target }} $STD
+          cargo zigbuild --release $LOCK --target ${{ matrix.rust_target }} $STD
           mkdir -p ../../out
           cp "target/${{ matrix.rust_target }}/release/client" ../../out/csqtt-core
 
