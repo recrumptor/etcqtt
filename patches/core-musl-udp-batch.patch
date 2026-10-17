@@ -1,0 +1,48 @@
+diff --git a/rust-client/udp_batch.rs b/rust-client/udp_batch.rs
+index debc34e..c14cfda 100644
+--- a/rust-client/udp_batch.rs
++++ b/rust-client/udp_batch.rs
+@@ -550,7 +550,8 @@ mod platform {
+         }
+         #[cfg(target_os = "linux")]
+         {
+-            unsafe { libc::recvmmsg(fd, messages, count, flags, timeout) }
++            // `flags as _`: у glibc/bionic тип c_int, у musl (libc >= 0.2.18x) — c_uint
++            unsafe { libc::recvmmsg(fd, messages, count, flags as _, timeout) }
+         }
+     }
+ 
+@@ -574,7 +575,7 @@ mod platform {
+         }
+         #[cfg(target_os = "linux")]
+         {
+-            unsafe { libc::sendmmsg(fd, messages, count, flags) }
++            unsafe { libc::sendmmsg(fd, messages, count, flags as _) }
+         }
+     }
+ 
+@@ -639,18 +640,12 @@ mod platform {
+     }
+ 
+     fn mmsg_header(iovec: *mut libc::iovec) -> libc::mmsghdr {
+-        libc::mmsghdr {
+-            msg_hdr: libc::msghdr {
+-                msg_name: ptr::null_mut(),
+-                msg_namelen: 0,
+-                msg_iov: iovec,
+-                msg_iovlen: 1,
+-                msg_control: ptr::null_mut(),
+-                msg_controllen: 0,
+-                msg_flags: 0,
+-            },
+-            msg_len: 0,
+-        }
++        // У musl в libc у `msghdr` есть приватные поля заполнения — литерал структуры
++        // не компилируется; собираем через zeroed и задаём нужные поля.
++        let mut msg_hdr: libc::msghdr = unsafe { std::mem::zeroed() };
++        msg_hdr.msg_iov = iovec;
++        msg_hdr.msg_iovlen = 1;
++        libc::mmsghdr { msg_hdr, msg_len: 0 }
+     }
+ }
+ 

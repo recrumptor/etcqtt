@@ -173,6 +173,20 @@ jobs:
           git clone --depth 1 --branch "${{ needs.check-version.outputs.core_ref }}" \
             https://github.com/${CORE_REPO}.git source
 
+      # Ядро v2.1.9 не собирается под musl с libc 0.2.189: recvmmsg/sendmmsg принимают flags: c_uint,
+      # а у msghdr приватные поля заполнения. Патч — patches/core-musl-udp-batch.patch.
+      - name: Patch core for musl
+        run: |
+          cd source
+          P="$GITHUB_WORKSPACE/patches/core-musl-udp-batch.patch"
+          if git apply --check "$P" 2>/dev/null; then
+            git apply "$P" && echo "патч применён"
+          elif git apply --reverse --check "$P" 2>/dev/null; then
+            echo "патч уже применён в исходниках — пропускаем"
+          else
+            echo "::warning::patches/core-musl-udp-batch.patch не применяется к ${{ needs.check-version.outputs.core_ref }} — собираем без него (возможна ошибка компиляции под musl)"
+          fi
+
       - name: Compile core (client)
         run: |
           STD=""; [ "${{ matrix.nightly }}" = "true" ] && STD="-Zbuild-std"
