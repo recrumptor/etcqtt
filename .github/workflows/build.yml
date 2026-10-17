@@ -161,17 +161,18 @@ jobs:
       - name: cargo-zigbuild
         run: cargo install cargo-zigbuild --locked
 
+      # клонируем ДО rust-cache: кэш создаёт source/rust-client/target и ломает git clone
+      - name: Clone core source
+        run: |
+          git clone --depth 1 --branch "${{ needs.check-version.outputs.core_ref }}" \
+            https://github.com/${CORE_REPO}.git source
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.rust_target }}
           workspaces: |
             wrapper
             source/rust-client
-
-      - name: Clone core source
-        run: |
-          git clone --depth 1 --branch "${{ needs.check-version.outputs.core_ref }}" \
-            https://github.com/${CORE_REPO}.git source
 
       # Ядро v2.1.9 не собирается под musl с libc 0.2.189: recvmmsg/sendmmsg принимают flags: c_uint,
       # а у msghdr приватные поля заполнения. Патч — patches/core-musl-udp-batch.patch.
