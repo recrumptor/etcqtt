@@ -10,6 +10,10 @@ on:
         description: 'Тестовая сборка (без публикации релиза)'
         type: boolean
         default: false
+      upx:
+        description: 'Сжимать бинарники UPX (все архитектуры; без галки — не сжимать)'
+        type: boolean
+        default: false
       core_ref:
         description: 'Тег/ветка ядра upstream (пусто = последний релиз)'
         type: string
@@ -133,7 +137,7 @@ jobs:
           - rust_target: mipsel-unknown-linux-musl
             nightly: true
             experimental: true
-            upx: true
+            upx: false   # SIGILL на mt7621 с UPX (причина не установлена) — включайте чекбоксом вручную
     steps:
       - uses: actions/checkout@v6
 
@@ -214,8 +218,10 @@ jobs:
             cargo zigbuild --release --locked --target ${{ matrix.rust_target }} $STD
           cp "target/${{ matrix.rust_target }}/release/csqtt" ../out/csqtt
 
+      # Ручной запуск: решает чекбокс upx (для всех архитектур).
+      # Автоматический (push/расписание): сжимается только то, что помечено upx: true в матрице (сейчас никто).
       - name: UPX
-        if: ${{ matrix.upx }}
+        if: ${{ inputs.upx || (github.event_name != 'workflow_dispatch' && matrix.upx) }}
         run: |
           ls -l out
           upx --best --lzma out/csqtt out/csqtt-core
