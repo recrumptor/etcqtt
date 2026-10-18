@@ -66,6 +66,38 @@ impl IfReq {
     }
 }
 
+fn set_addr_on(sock: RawFd, name: &str, ip: Ipv4Addr, prefix: u8) -> io::Result<()> {
+    let mut r = IfReq::new(name)?;
+    r.set_addr(ip);
+    ioctl(sock, SIOCSIFADDR, &mut r)?;
+    let mask = if prefix == 0 { 0u32 } else { u32::MAX << (32 - prefix.min(32) as u32) };
+    let mut r = IfReq::new(name)?;
+    r.set_addr(Ipv4Addr::from(mask));
+    ioctl(sock, SIOCSIFNETMASK, &mut r)
+}
+
+/// Назначает (заменяет) IPv4-адрес существующего интерфейса. Нужен для адреса, выданного сервером
+/// (TUNCONF): без адреса на csqtt0 привязанные через SO_BINDTODEVICE сокеты не выберут source-адрес.
+pub fn set_addr(name: &str, ip: Ipv4Addr, prefix: u8) -> io::Result<()> {
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if sock < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let sock = unsafe { OwnedFd::from_raw_fd(sock) };
+    set_addr_on(sock.as_raw_fd(), name, ip, prefix)
+}
+
+/// "TUNCONF:10.66.67.3:1.1.1.1[:...]" → (клиентский IP, DNS)
+pub fn parse_tunconf(s: &str) -> Option<(Ipv4Addr, String)> {
+    let rest = s.trim().strip_prefix("TUNCONF:")?;
+    let mut it = rest.splitn(3, ':');
+    let ip: Ipv4Addr = it.next()?.trim().parse().ok()?;
+    if ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() {
+        return None;
+    }
+    Some((ip, it.next().unwrap_or("").trim().to_string()))
+}
+
 pub struct Tun {
     pub fd: OwnedFd,
     pub name: String,
@@ -102,13 +134,7 @@ pub fn create(name: &str, mtu: u32, addr: Option<(Ipv4Addr, u8)>) -> io::Result<
     r.set_i32(mtu as i32);
     ioctl(s, SIOCSIFMTU, &mut r)?;
     if let Some((ip, prefix)) = addr {
-        let mut r = IfReq::new(name)?;
-        r.set_addr(ip);
-        ioctl(s, SIOCSIFADDR, &mut r)?;
-        let mask = if prefix == 0 { 0u32 } else { u32::MAX << (32 - prefix.min(32) as u32) };
-        let mut r = IfReq::new(name)?;
-        r.set_addr(Ipv4Addr::from(mask));
-        ioctl(s, SIOCSIFNETMASK, &mut r)?;
+        set_addr_on(s, name, ip, prefix)?;
     }
     let mut r = IfReq::new(name)?;
     ioctl(s, SIOCGIFFLAGS, &mut r)?;
@@ -206,6 +232,15 @@ mod tests {
         assert_eq!(parse_cidr("10.66.67.7/24"), Some((Ipv4Addr::new(10, 66, 67, 7), 24)));
         assert!(parse_cidr("10.0.0.1").is_none());
         assert!(parse_cidr("10.0.0.1/33").is_none());
+    }
+    #[test]
+    fn tunconf() {
+        assert_eq!(parse_tunconf("TUNCONF:10.66.67.3:1.1.1.1"), Some((Ipv4Addr::new(10, 66, 67, 3), "1.1.1.1".to_string())));
+        assert_eq!(parse_tunconf(" TUNCONF:10.66.67.9:8.8.8.8:extra "), Some((Ipv4Addr::new(10, 66, 67, 9), "8.8.8.8".to_string())));
+        assert_eq!(parse_tunconf("TUNCONF:10.66.67.4"), Some((Ipv4Addr::new(10, 66, 67, 4), String::new())));
+        assert!(parse_tunconf("TUNCONF:0.0.0.0:1.1.1.1").is_none());
+        assert!(parse_tunconf("TUNCONF:nope:1.1.1.1").is_none());
+        assert!(parse_tunconf("CONFIG:10.66.67.3").is_none());
     }
     #[test]
     fn ioctl_number_x86() {

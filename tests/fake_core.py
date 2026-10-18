@@ -67,6 +67,8 @@ if "captcha" in peer:
     if not captcha_result or captcha_result[0].startswith("error:"):
         ev("ERROR", code="E_CAPTCHA", message="captcha failed", fatal=True); sys.exit(1)
 
+# как настоящее ядро: сервер выдаёт клиенту адрес туннеля (TUNCONF) до начала передачи данных
+ev("CONFIG", config="TUNCONF:10.255.88.9:1.1.1.1")
 ev("READY", worker=1)
 sent = 0
 while not stop.is_set():

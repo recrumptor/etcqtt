@@ -229,6 +229,8 @@ struct Session {
     uds: String,
     tun_sent: bool,
     tun_deadline: Instant,
+    client_ip: Option<std::net::Ipv4Addr>,
+    dns: String,
 }
 
 struct Sup {
@@ -547,6 +549,8 @@ impl Sup {
             uds: uds.clone(),
             tun_sent: false,
             tun_deadline: now + Duration::from_secs(15),
+            client_ip: None,
+            dns: String::new(),
         });
         self.set_pool_state(id, "");
         self.last_error.clear();
@@ -671,6 +675,8 @@ impl Sup {
             }
         }
         let mut fail: Option<(String, &'static str)> = None;
+        let ifname_cfg = self.set.ifname.clone();
+        let server_addr = self.set.tun_address.is_empty(); // пусто = адрес, выданный сервером
         for m in msgs {
             let Some(s) = self.sess.as_mut() else { return };
             match m {
@@ -713,8 +719,24 @@ impl Sup {
                             fail = Some((format!("{}: {}", code, msg), kind));
                         }
                     }
+                    "CONFIG" => {
+                        if let Some((ip, dns)) = data["config"].as_str().and_then(tun::parse_tunconf) {
+                            logi!("сервер выдал адрес туннеля {} (DNS {})", ip, if dns.is_empty() { "—" } else { &dns });
+                            s.client_ip = Some(ip);
+                            s.dns = dns;
+                            if server_addr {
+                                // как Android-клиент: адрес /32; маршрутов не добавляем (interface-only)
+                                match tun::set_addr(&ifname_cfg, ip, 32) {
+                                    Ok(()) => logi!("адрес {}/32 назначен на {}", ip, ifname_cfg),
+                                    Err(e) => logw!("не удалось назначить {} на {}: {}", ip, ifname_cfg, e),
+                                }
+                            }
+                        } else {
+                            logd!("ядро: CONFIG {}", data);
+                        }
+                    }
                     "STOPPED" => logi!("ядро сообщило STOPPED"),
-                    "SERVER_RESTART" | "NETWORK_SUSPECT" | "PROGRESS" | "PROCESS" | "CONFIG" => logd!("ядро: {} {}", kind, data),
+                    "SERVER_RESTART" | "NETWORK_SUSPECT" | "PROGRESS" | "PROCESS" => logd!("ядро: {} {}", kind, data),
                     _ => logd!("ядро: событие {} {}", kind, data),
                 },
                 Msg::Captcha { mode, uri, session: _ } => {
@@ -895,6 +917,7 @@ impl Sup {
             if let Some(rx) = &s.probe_rx {
                 if let Ok(ok) = rx.try_recv() {
                     s.probe_rx = None;
+                    s.last_probe = Instant::now(); // следующая проба — через interval после завершения этой
                     s.access_checked_at = util::now_secs();
                     if ok {
                         s.probe_ok += 1;
@@ -909,20 +932,33 @@ impl Sup {
                     }
                 }
             }
-            let probing = !target.is_empty() && (health_mode == "both" || health_mode == "probe" || health_mode == "access");
+            // Явный health_target (TCP) участвует в failover. Если он не задан, используется цель по
+            // умолчанию — DNS-запрос к DNS, выданному сервером, через интерфейс туннеля: только
+            // информация (access_state), без failover — внешние причины не должны ронять рабочий профиль.
+            let mode_probe = health_mode == "both" || health_mode == "probe" || health_mode == "access";
+            let explicit = !target.is_empty();
+            let default_dns = if explicit { None } else { first_dns_ip(&s.dns) };
+            let probing = mode_probe && (explicit || default_dns.is_some());
             if probing && s.probe_rx.is_none() && now.duration_since(s.last_probe) >= Duration::from_secs(interval) {
                 s.last_probe = now;
-                s.access = "checking";
+                // прошлый результат (ok/failed) остаётся видимым, пока идёт новая проба
+                if matches!(s.access, "waiting" | "skipped") {
+                    s.access = "checking";
+                }
                 let (tx, rx) = mpsc::channel();
-                let (t, i) = (target.clone(), ifname.clone());
+                let (t, i, d) = (target.clone(), ifname.clone(), default_dns.clone());
                 std::thread::spawn(move || {
-                    let _ = tx.send(tcp_probe(&t, &i));
+                    let ok = match d {
+                        Some(ip) if t.is_empty() => dns_probe(&ip, 53, &i),
+                        _ => tcp_probe(&t, &i),
+                    };
+                    let _ = tx.send(ok);
                 });
                 s.probe_rx = Some(rx);
             } else if !probing {
                 s.access = "skipped";
             }
-            if probing && s.probe_fail >= thr && fail.is_none() {
+            if explicit && probing && s.probe_fail >= thr && fail.is_none() {
                 fail = Some((format!("проверка доступа {} не проходит ({} раз подряд)", target, s.probe_fail), "fail"));
             }
             if failback && fail.is_none() {
@@ -1004,8 +1040,9 @@ impl Sup {
                     "stale": false,
                     "access_state": s.access,
                     "access_checked_at": s.access_checked_at,
-                    "access_target": self.set.health_target,
-                    "access_target_default": false,
+                    "access_target": if !self.set.health_target.is_empty() { self.set.health_target.clone() }
+                        else { first_dns_ip(&s.dns).map(|ip| format!("{}:53", ip)).unwrap_or_default() },
+                    "access_target_default": self.set.health_target.is_empty() && first_dns_ip(&s.dns).is_some(),
                 }),
                 s.prof_id.clone(),
                 s.active.max(0),
@@ -1065,7 +1102,9 @@ impl Sup {
             "enabled": self.set.enabled,
             "active_profile": active_profile,
             "selection_mode": self.set.mode,
-            "tunnel": {"interface": self.set.ifname, "present": tun::exists(&self.set.ifname)},
+            "tunnel": {"interface": self.set.ifname, "present": tun::exists(&self.set.ifname),
+                       "client_ip": self.sess.as_ref().and_then(|s| s.client_ip).map(|i| i.to_string()),
+                       "dns": self.sess.as_ref().map(|s| s.dns.clone()).filter(|d| !d.is_empty())},
             "connectivity": session_obj,
             "tx_bytes": up,
             "rx_bytes": down,
@@ -1155,6 +1194,45 @@ pub fn validate_hashes(vk: &str, fingerprint: &str, client_ids: &str) -> Vec<(St
     }
     let _ = child.wait();
     out
+}
+
+/// Первый IPv4-адрес из списка DNS ("1.1.1.1,8.8.8.8").
+pub fn first_dns_ip(dns: &str) -> Option<String> {
+    dns.split(',').map(str::trim).find_map(|x| x.parse::<std::net::Ipv4Addr>().ok()).map(|ip| ip.to_string())
+}
+
+/// Минимальный DNS-запрос A для example.com (id 0x4351).
+pub fn dns_query() -> Vec<u8> {
+    let mut q = vec![0x43, 0x51, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in ["example", "com"] {
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.extend_from_slice(&[0, 0, 1, 0, 1]);
+    q
+}
+
+/// Ответ на наш запрос: тот же id и бит QR.
+pub fn is_dns_response(resp: &[u8]) -> bool {
+    resp.len() >= 12 && resp[0] == 0x43 && resp[1] == 0x51 && resp[2] & 0x80 != 0
+}
+
+/// DNS-проба через интерфейс туннеля (SO_BINDTODEVICE): подтверждает сквозной путь «туннель → сервер → интернет».
+pub fn dns_probe(ip: &str, port: u16, ifname: &str) -> bool {
+    use std::net::UdpSocket;
+    let Ok(addr) = format!("{}:{}", ip, port).parse::<SocketAddr>() else { return false };
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return false };
+    let name = std::ffi::CString::new(ifname).unwrap_or_default();
+    let r = unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE, name.as_ptr() as *const _, ifname.len() as libc::socklen_t) };
+    if r < 0 {
+        return false; // без привязки к туннелю проба была бы ложной (ушла бы через WAN)
+    }
+    sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    if sock.connect(addr).is_err() || sock.send(&dns_query()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    matches!(sock.recv(&mut buf), Ok(n) if is_dns_response(&buf[..n]))
 }
 
 /// TCP-проба "host:port" с привязкой сокета к интерфейсу туннеля.
@@ -1275,6 +1353,36 @@ mod tests {
     fn base64_matches() {
         assert_eq!(b64(b"{\"token\":\"x\"}"), "eyJ0b2tlbiI6IngifQ==");
         assert_eq!(b64(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn dns_helpers() {
+        assert_eq!(first_dns_ip("1.1.1.1,8.8.8.8").as_deref(), Some("1.1.1.1"));
+        assert_eq!(first_dns_ip(" x, 9.9.9.9").as_deref(), Some("9.9.9.9"));
+        assert_eq!(first_dns_ip(""), None);
+        let q = dns_query();
+        assert_eq!(q.len(), 12 + 1 + 7 + 1 + 3 + 1 + 4);
+        let mut resp = q.clone();
+        resp[2] |= 0x80;
+        assert!(is_dns_response(&resp) && !is_dns_response(&q) && !is_dns_response(&[0u8; 4]));
+    }
+
+    /// root (SO_BINDTODEVICE): cargo test -- --ignored
+    #[test]
+    #[ignore]
+    fn dns_probe_loopback() {
+        let srv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = srv.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 512];
+            if let Ok((n, from)) = srv.recv_from(&mut b) {
+                let mut r = b[..n].to_vec();
+                r[2] |= 0x80;
+                let _ = srv.send_to(&r, from);
+            }
+        });
+        assert!(dns_probe("127.0.0.1", port, "lo"));
+        assert!(!dns_probe("127.0.0.1", port.wrapping_add(1), "lo")); // порт молчит → таймаут
     }
 
     #[test]

@@ -9,7 +9,7 @@ cfgp, stp, logp, flog = f"{d}/csqtt", f"{d}/run/status.json", f"{d}/csqtt.log", 
 os.makedirs(f"{d}/run")
 PORT = 18443
 
-def write_cfg(extra_main="", profiles=None):
+def write_cfg(extra_main="", profiles=None, tun_address="10.255.88.1/30"):
     profiles = profiles if profiles is not None else [("p1", 10, "good1.example:46000"), ("p2", 20, "good2.example:46000")]
     t = f"""config csqtt 'main'
 \toption enabled '1'
@@ -21,7 +21,8 @@ def write_cfg(extra_main="", profiles=None):
 \toption cooldown '60'
 \toption reconnect_delay '1'
 \toption tun_mtu '1280'
-\toption tun_address '10.255.88.1/30'
+\toption health_interval '1'
+\toption tun_address '{tun_address}'
 \toption helper_bind '127.0.0.1'
 \toption log_level 'debug'
 \toption vk 'hashA,hashB'
@@ -52,6 +53,17 @@ def dump():
     for f in (logp, flog):
         if os.path.exists(f):
             print(f"--- {f}"); print(open(f).read()[-3000:])
+
+def iface_addr(name):
+    import fcntl, socket, struct
+    sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        r = fcntl.ioctl(sk.fileno(), 0x8915, struct.pack("256s", name.encode()))  # SIOCGIFADDR
+        return socket.inet_ntoa(r[20:24])
+    except OSError:
+        return None
+    finally:
+        sk.close()
 
 def api(path, method="GET"):
     r = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}", method=method)
@@ -87,6 +99,15 @@ try:
     check(s["tunnel"]["present"] and s["connectivity"]["tun_present"], "TUN csqtt_it0 создан")
     check(open("/sys/class/net/csqtt_it0/mtu").read().strip() == "1280", "MTU 1280 применён")
     wait(lambda s: s["tx_bytes"] > 0, "счётчики")
+    s = wait(lambda s: s["tunnel"].get("client_ip"), "адрес от сервера в status.json")
+    check(s["tunnel"]["client_ip"] == "10.255.88.9" and s["tunnel"]["dns"] == "1.1.1.1", "адрес и DNS от сервера отражены в status.json")
+    check(iface_addr("csqtt_it0") == "10.255.88.1", "явный tun_address сохранён (адрес сервера не перекрывает его)")
+    # цель проверки по умолчанию (DNS сервера через туннель) — только информация, без failover
+    s = wait(lambda s: s["connectivity"].get("access_state") == "failed", "проба доступа завершилась (в песочнице ответа нет)", 25)
+    check(s["connectivity"]["access_target"] == "1.1.1.1:53" and s["connectivity"]["access_target_default"] is True, "цель по умолчанию: DNS сервера 1.1.1.1:53")
+    time.sleep(6)
+    s = status()
+    check(s["connected"] and s["active_profile"] == "p1" and s["reconnects"] == 0, "неудачная проба по умолчанию НЕ вызывает failover")
     check(s["workers"]["configured"] == 6, "workers.configured из конфига")
     check(any(p["id"] == "p1" and p["state"] == "active" for p in s["profiles"]), "p1 в состоянии active")
     check("got tun fd, ifname_ok=True" in open(flog).read(), "ядро получило дескриптор TUN")
@@ -155,6 +176,13 @@ try:
     check(not os.path.exists("/sys/class/net/csqtt_it0"), "TUN исчез после остановки")
     r = subprocess.run([BIN, "status", "--status-path", stp], capture_output=True, text=True)
     check(r.returncode == 2, "csqtt status → 2 (не запущена)")
+    # ---- 7. tun_address пуст → назначается адрес, выданный сервером (/32), как у Android-клиента
+    write_cfg(tun_address=""); start()
+    s = wait(lambda s: s.get("connected") and s["tunnel"].get("client_ip"), "подключение с адресом от сервера")
+    check(iface_addr("csqtt_it0") == "10.255.88.9", "адрес сервера 10.255.88.9 назначен на csqtt_it0")
+    check("адрес 10.255.88.9/32 назначен" in open(logp).read(), "в журнале запись о назначении адреса")
+    proc.send_signal(signal.SIGTERM)
+    check(proc.wait(timeout=15) == 0, "повторная остановка → код 0")
     print("\nВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
 finally:
     if proc and proc.poll() is None:
