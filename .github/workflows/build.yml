@@ -301,8 +301,9 @@ jobs:
         id: sdk
         run: |
           BRANCH="${{ matrix.openwrt_ver }}"
+          # Берем предпоследнюю версию, чтобы автоматически пропустить свежий релиз без SDK
           FULL_VER=$(curl -s "https://downloads.openwrt.org/releases/" \
-            | grep -oE "${BRANCH//./\\.}\.[0-9]+" | sort -V | uniq | tail -1)
+            | grep -oE "${BRANCH//./\\.}\.[0-9]+" | sort -V | uniq | tail -2 | head -1)
           [ -z "$FULL_VER" ] && exit 1
           echo "OpenWrt $BRANCH -> $FULL_VER"
           BASE_URL="https://downloads.openwrt.org/releases/$FULL_VER/targets/${{ matrix.target_name }}"
@@ -375,9 +376,11 @@ jobs:
         id: sdk
         run: |
           BRANCH="${{ matrix.openwrt_ver }}"
+          # Берем предпоследнюю версию, чтобы автоматически пропустить свежий релиз без SDK
           FULL_VER=$(curl -s "https://downloads.openwrt.org/releases/" \
-            | grep -oE "${BRANCH//./\\.}\.[0-9]+" | sort -V | uniq | tail -1)
+            | grep -oE "${BRANCH//./\\.}\.[0-9]+" | sort -V | uniq | tail -2 | head -1)
           [ -z "$FULL_VER" ] && exit 1
+          echo "OpenWrt $BRANCH -> $FULL_VER"
           BASE_URL="https://downloads.openwrt.org/releases/$FULL_VER/targets/${{ matrix.target_name }}"
           SDK_FILENAME=$(curl -s "$BASE_URL/" \
             | grep -o 'href="[^"]*openwrt-sdk-[^"]*\.tar\.\(zst\|xz\)"' \
