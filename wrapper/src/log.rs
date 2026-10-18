@@ -40,10 +40,17 @@ pub fn set_level(level: &str) {
     }
 }
 
+// musl >= 1.2 использует 64-битный time_t на всех архитектурах, а `libc::time_t` у 32-битных
+// musl-целей всё ещё 32-битный (deprecated) — поэтому объявляем localtime_r с i64 сами.
+#[allow(clashing_extern_declarations)]
+extern "C" {
+    fn localtime_r(t: *const i64, tm: *mut libc::tm) -> *mut libc::tm;
+}
+
 fn stamp() -> String {
-    let t = util::now_secs() as libc::time_t;
+    let t: i64 = util::now_secs() as i64;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
+    unsafe { localtime_r(&t, &mut tm) };
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 

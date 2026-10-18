@@ -9,11 +9,12 @@ pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Монотонные секунды (для интервалов; не зависит от смены системного времени).
+/// Монотонные секунды с запуска процесса (+1, чтобы значение было > 0).
+/// Через std::time::Instant, а не libc::clock_gettime: на 32-битном musl 1.2 у libc-крейта
+/// `time_t` 32-битный, а у реального musl — 64-битный (несовпадение размера структуры).
 pub fn mono_secs() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1
 }
 
 /// Атомарная запись: tmp в том же каталоге + rename. mode — права файла.

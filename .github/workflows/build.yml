@@ -126,18 +126,22 @@ jobs:
             nightly: false
             experimental: false
             upx: false
+            rustflags: ""
           - rust_target: aarch64-unknown-linux-musl
             nightly: false
             experimental: false
             upx: false
+            rustflags: ""
           - rust_target: armv7-unknown-linux-musleabihf
             nightly: false
             experimental: true
             upx: false
+            rustflags: ""
           - rust_target: mipsel-unknown-linux-musl
             nightly: true
             experimental: true
             upx: false   # SIGILL на mt7621 с UPX (причина не установлена) — включайте чекбоксом вручную
+            rustflags: "-C relocation-model=static"   # без static-PIE: на mips32 с musl он даёт TEXTREL и падает при старте (SIGSEGV/SIGILL)
     steps:
       - uses: actions/checkout@v6
 
@@ -201,6 +205,8 @@ jobs:
           cargo add portable-atomic@1
 
       - name: Compile core (client)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           STD=""; [ "${{ matrix.nightly }}" = "true" ] && STD="-Zbuild-std"
           # для mipsel добавлена зависимость portable-atomic → Cargo.lock меняется, --locked нельзя
@@ -211,6 +217,8 @@ jobs:
           cp "target/${{ matrix.rust_target }}/release/client" ../../out/csqtt-core
 
       - name: Compile wrapper (csqtt)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           STD=""; [ "${{ matrix.nightly }}" = "true" ] && STD="-Zbuild-std=std,panic_abort"
           cd wrapper
@@ -228,11 +236,27 @@ jobs:
           upx -t out/csqtt out/csqtt-core
           ls -l out
 
-      - name: Smoke test (x86_64)
-        if: ${{ matrix.rust_target == 'x86_64-unknown-linux-musl' }}
+      # Запуск собранных бинарников (после UPX) нативно или под qemu-user: ловит SIGSEGV/SIGILL при старте
+      # ещё до упаковки (именно так выглядел баг static-PIE на mipsel).
+      - name: Smoke test (native / qemu-user)
         run: |
+          sudo apt-get install -y qemu-user
+          case "${{ matrix.rust_target }}" in
+            x86_64-*)  RUN="" ;;
+            aarch64-*) RUN="qemu-aarch64" ;;
+            armv7-*)   RUN="qemu-arm" ;;
+            mipsel-*)  RUN="qemu-mipsel -cpu 24Kc" ;;
+            *) echo "нет эмулятора для ${{ matrix.rust_target }}"; exit 1 ;;
+          esac
           file out/csqtt out/csqtt-core
-          ./out/csqtt version
+          printf "config server 'x'\n\toption peer 'a:1'\n\toption password 'p'\n" > /tmp/smoke.cfg
+          $RUN ./out/csqtt version
+          # разбор конфига с секцией (на этом падал static-PIE): ожидаем ссылку и код 0
+          $RUN ./out/csqtt profile export x --config /tmp/smoke.cfg | grep -q '^csqtt://connect'
+          # ядро без аргументов: допустима ошибка clap (код < 128) или таймаут, но не сигнал
+          rc=0; timeout 20 $RUN ./out/csqtt-core >/dev/null 2>&1 || rc=$?
+          echo "csqtt-core rc=$rc"
+          if [ "$rc" -ge 128 ] && [ "$rc" -ne 124 ]; then echo "ядро упало по сигналу ($((rc-128)))"; exit 1; fi
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
