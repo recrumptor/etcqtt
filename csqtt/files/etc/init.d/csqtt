@@ -80,6 +80,8 @@ start_service() {
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param limits core="0 0"
+	# часовой пояс роутера (иначе musl в демоне показывает UTC, а logread — локальное время)
+	[ -r /etc/TZ ] && procd_set_param env TZ="$(cat /etc/TZ)"
 	procd_close_instance
 }
 

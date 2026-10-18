@@ -15,9 +15,7 @@
 					"captcha_helper_info"
 				]
 			},
-			"uci": {
-				"csqtt": true
-			}
+			"uci": [ "csqtt" ]
 		},
 		"write": {
 			"ubus": {
@@ -35,9 +33,7 @@
 					"captcha_helper_url"
 				]
 			},
-			"uci": {
-				"csqtt": true
-			}
+			"uci": [ "csqtt" ]
 		}
 	}
 }
