@@ -24,6 +24,13 @@ pub fn version_string() -> String {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(150);
 const STATUS_EVERY: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(200);
+/// Информационная проба по умолчанию (DNS через туннель) — не чаще, чем раз в столько секунд.
+const DEFAULT_PROBE_MIN_SECS: u64 = 30;
+
+/// «N секунд назад» без паники, если время работы системы меньше N (Instant - Duration может переполниться).
+fn ago(secs: u64) -> Instant {
+    Instant::now().checked_sub(Duration::from_secs(secs)).unwrap_or_else(Instant::now)
+}
 
 static SIG_HUP: AtomicBool = AtomicBool::new(false);
 static SIG_TERM: AtomicBool = AtomicBool::new(false);
@@ -265,6 +272,7 @@ struct Sup {
     last_error: String,
     started_at: u64,
     last_status: Instant,
+    last_req: Instant,
     access_req_seen: u64,
     hash_req_seen: u64,
     hashes: Arc<Mutex<HashInfo>>,
@@ -352,7 +360,8 @@ pub fn run(opts: Opts) -> i32 {
         history: Vec::new(),
         last_error: String::new(),
         started_at: util::now_secs(),
-        last_status: Instant::now() - Duration::from_secs(10),
+        last_status: ago(10),
+        last_req: Instant::now(),
         access_req_seen: util::file_mtime("/var/run/csqtt/access-check.request"),
         hash_req_seen: util::file_mtime("/var/run/csqtt/hash-check.request"),
         hashes: Arc::new(Mutex::new(HashInfo::default())),
@@ -553,7 +562,7 @@ impl Sup {
             auto_js,
             probe_fail: 0,
             probe_ok: 0,
-            last_probe: now,
+            last_probe: ago(3600), // первая проба — сразу после подключения
             probe_rx: None,
             access: "waiting",
             access_checked_at: 0,
@@ -672,7 +681,10 @@ impl Sup {
             return;
         }
         self.pump_messages();
-        self.check_requests();
+        if self.last_req.elapsed() >= Duration::from_secs(1) {
+            self.last_req = Instant::now();
+            self.check_requests();
+        }
         self.check_health();
     }
 
@@ -829,7 +841,7 @@ impl Sup {
         if m > self.access_req_seen {
             self.access_req_seen = m;
             if let Some(s) = self.sess.as_mut() {
-                s.last_probe = Instant::now() - Duration::from_secs(3600); // проба сразу
+                s.last_probe = ago(3600); // проба сразу
                 logi!("запрошена ручная проверка доступа");
             }
         }
@@ -951,7 +963,8 @@ impl Sup {
             let explicit = !target.is_empty();
             let default_dns = if explicit { None } else { first_dns_ip(&s.dns) };
             let probing = mode_probe && (explicit || default_dns.is_some());
-            if probing && s.probe_rx.is_none() && now.duration_since(s.last_probe) >= Duration::from_secs(interval) {
+            let probe_every = if explicit { interval } else { interval.max(DEFAULT_PROBE_MIN_SECS) };
+            if probing && s.probe_rx.is_none() && now.duration_since(s.last_probe) >= Duration::from_secs(probe_every) {
                 s.last_probe = now;
                 // прошлый результат (ok/failed) остаётся видимым, пока идёт новая проба
                 if matches!(s.access, "waiting" | "skipped") {

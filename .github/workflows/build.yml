@@ -231,9 +231,11 @@ jobs:
       - name: UPX
         if: ${{ inputs.upx || (github.event_name != 'workflow_dispatch' && matrix.upx) }}
         run: |
+          # Сжимаем только ядро: оно стартует один раз за подключение. Обёртку csqtt НЕ сжимаем — LuCI (rpcd)
+          # запускает её каждые несколько секунд, и распаковка LZMA на каждый запуск стоит ~0.3 с на mt7621.
           ls -l out
-          upx --best --lzma out/csqtt out/csqtt-core
-          upx -t out/csqtt out/csqtt-core
+          upx --best --lzma out/csqtt-core
+          upx -t out/csqtt-core
           ls -l out
 
       # Запуск собранных бинарников (после UPX) нативно или под qemu-user: ловит SIGSEGV/SIGILL при старте
