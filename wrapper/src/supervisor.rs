@@ -125,6 +125,17 @@ pub fn normalize_hashes(s: &str) -> String {
     s.split(|c: char| c == ',' || c == ';' || c == '+' || c.is_whitespace()).map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().join(",")
 }
 
+/// Эффективные транспорт и обфускация профиля (с учётом общих настроек и значений по умолчанию ядра).
+pub fn effective_settings(cfg: &Config, prof: &Section) -> (String, String) {
+    let or = |v: String, d: &str| if v.is_empty() { d.to_string() } else { v };
+    (or(cfg.shared(prof, "turn_transport"), "udp"), or(cfg.shared(prof, "obfs"), "audio"))
+}
+
+/// Текущий MTU интерфейса из sysfs (None, если интерфейса нет).
+fn iface_mtu(name: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{}/mtu", name)).ok()?.trim().parse().ok()
+}
+
 /// Аргументы ядра для профиля. Чистая функция — покрыта тестами.
 pub fn core_args(cfg: &Config, prof: &Section, uds: &str) -> Result<Vec<String>, String> {
     let g = |k: &str| cfg.shared(prof, k);
@@ -164,8 +175,9 @@ pub fn core_args(cfg: &Config, prof: &Section, uds: &str) -> Result<Vec<String>,
     push("--fingerprint", or(g("fingerprint"), "chrome"));
     push("--client-ids", g("client_ids"));
     push("-n", workers);
-    push("--obfs", or(g("obfs"), "audio"));
-    push("--turn-transport", or(g("turn_transport"), "udp"));
+    let (transport, obfs) = effective_settings(cfg, prof);
+    push("--obfs", obfs);
+    push("--turn-transport", transport);
     push("--tun-uds", uds.to_string());
     Ok(a)
 }
@@ -1103,6 +1115,7 @@ impl Sup {
             "active_profile": active_profile,
             "selection_mode": self.set.mode,
             "tunnel": {"interface": self.set.ifname, "present": tun::exists(&self.set.ifname),
+                       "mtu": iface_mtu(&self.set.ifname),
                        "client_ip": self.sess.as_ref().and_then(|s| s.client_ip).map(|i| i.to_string()),
                        "dns": self.sess.as_ref().map(|s| s.dns.clone()).filter(|d| !d.is_empty())},
             "connectivity": session_obj,
@@ -1122,6 +1135,8 @@ impl Sup {
         }
         if let Some(sec) = self.sess.as_ref().and_then(|s| self.cfg.server(&s.prof_id)) {
             st["vk_hashes"] = self.vk_hashes_json(&sec);
+            let (transport, obfs) = effective_settings(&self.cfg, &sec);
+            st["effective"] = json!({"turn_transport": transport, "obfs": obfs});
         }
         if st["auto_api"].is_null() {
             st.as_object_mut().unwrap().remove("auto_api");
@@ -1342,6 +1357,21 @@ mod tests {
         let t2 = t.replace("option device_id", "option vk_js_token 'T'\n\toption device_id");
         let cfg2 = Config::parse(&t2);
         assert!(core_args(&cfg2, &cfg2.server("p1").unwrap(), "u").is_ok());
+    }
+
+    #[test]
+    fn effective_defaults_and_overrides() {
+        let cfg = Config::parse(CFG);
+        let sec = cfg.server("p1").unwrap();
+        assert_eq!(effective_settings(&cfg, &sec), ("udp".to_string(), "audio".to_string()));
+        let a = core_args(&cfg, &sec, "u").unwrap().join(" ");
+        assert!(a.contains("--turn-transport udp") && a.contains("--obfs audio"));
+        let t = CFG.replace("option workers '12'", "option workers '12'\n\toption turn_transport 'tcp'");
+        let cfg2 = Config::parse(&t);
+        assert_eq!(effective_settings(&cfg2, &cfg2.server("p1").unwrap()).0, "tcp");
+        let t3 = t.replace("option password 'secret'", "option password 'secret'\n\toption obfs 'none'");
+        let cfg3 = Config::parse(&t3);
+        assert_eq!(effective_settings(&cfg3, &cfg3.server("p1").unwrap()), ("tcp".to_string(), "none".to_string()));
     }
 
     #[test]

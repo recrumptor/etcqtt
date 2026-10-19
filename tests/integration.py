@@ -101,6 +101,8 @@ try:
     wait(lambda s: s["tx_bytes"] > 0, "счётчики")
     s = wait(lambda s: s["tunnel"].get("client_ip"), "адрес от сервера в status.json")
     check(s["tunnel"]["client_ip"] == "10.255.88.9" and s["tunnel"]["dns"] == "1.1.1.1", "адрес и DNS от сервера отражены в status.json")
+    check(s["tunnel"]["mtu"] == 1280, "tunnel.mtu = фактический MTU интерфейса")
+    check(s["effective"] == {"turn_transport": "udp", "obfs": "audio"}, "effective: транспорт и обфускация по умолчанию (udp / audio)")
     check(iface_addr("csqtt_it0") == "10.255.88.1", "явный tun_address сохранён (адрес сервера не перекрывает его)")
     # цель проверки по умолчанию (DNS сервера через туннель) — только информация, без failover
     s = wait(lambda s: s["connectivity"].get("access_state") == "failed", "проба доступа завершилась (в песочнице ответа нет)", 25)
