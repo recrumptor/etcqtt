@@ -8,8 +8,10 @@ d = tempfile.mkdtemp(prefix="csqtt-it-")
 cfgp, stp, logp, flog = f"{d}/csqtt", f"{d}/run/status.json", f"{d}/csqtt.log", f"{d}/fake.log"
 os.makedirs(f"{d}/run")
 PORT = 18443
+MODE = os.environ.get("CORE_MODE", "modern")        # modern = ядро 2.5.0+, legacy = 2.1.x
+MARK = f"{d}/tunlost.mark"
 
-def write_cfg(extra_main="", profiles=None, tun_address="10.255.88.1/30"):
+def write_cfg(extra_main="", profiles=None, tun_address="10.255.88.1/30", pw_suffix=""):
     profiles = profiles if profiles is not None else [("p1", 10, "good1.example:46000"), ("p2", 20, "good2.example:46000")]
     t = f"""config csqtt 'main'
 \toption enabled '1'
@@ -31,7 +33,7 @@ def write_cfg(extra_main="", profiles=None, tun_address="10.255.88.1/30"):
 {extra_main}
 """
     for pid, prio, peer in profiles:
-        t += f"\nconfig server '{pid}'\n\toption name 'Name {pid}'\n\toption enabled '1'\n\toption priority '{prio}'\n\toption peer '{peer}'\n\toption password 'pw-{pid}'\n"
+        t += f"\nconfig server '{pid}'\n\toption name 'Name {pid}'\n\toption enabled '1'\n\toption priority '{prio}'\n\toption peer '{peer}'\n\toption password 'pw-{pid}{pw_suffix}'\n"
     open(cfgp, "w").write(t)
 
 def status():
@@ -84,7 +86,9 @@ def check(cond, msg):
 FAKE = f"{d}/fake_core.py"
 shutil.copyfile(f"{HERE}/fake_core.py", FAKE)
 os.chmod(FAKE, 0o755)
-env = dict(os.environ, CSQTT_CORE=FAKE, FAKE_LOG=flog, TUN_NAME="csqtt_it0")
+env = dict(os.environ, CSQTT_CORE=FAKE, FAKE_LOG=flog, TUN_NAME="csqtt_it0", FAKE_MODE=MODE, FAKE_MARK=MARK,
+           CSQTT_CORE_VERSION="2.5.0" if MODE == "modern" else "2.1.9")
+print(f"== режим ядра: {MODE} ==")
 proc = None
 def start():
     global proc
@@ -102,7 +106,8 @@ try:
     s = wait(lambda s: s["tunnel"].get("client_ip"), "адрес от сервера в status.json")
     check(s["tunnel"]["client_ip"] == "10.255.88.9" and s["tunnel"]["dns"] == "1.1.1.1", "адрес и DNS от сервера отражены в status.json")
     check(s["tunnel"]["mtu"] == 1280, "tunnel.mtu = фактический MTU интерфейса")
-    check(s["effective"] == {"turn_transport": "udp", "obfs": "audio"}, "effective: транспорт и обфускация по умолчанию (udp / audio)")
+    want_obfs = "unified" if MODE == "modern" else "audio"
+    check(s["effective"] == {"turn_transport": "udp", "obfs": want_obfs}, f"effective: транспорт и обфускация по умолчанию (udp / {want_obfs})")
     check(iface_addr("csqtt_it0") == "10.255.88.1", "явный tun_address сохранён (адрес сервера не перекрывает его)")
     # цель проверки по умолчанию (DNS сервера через туннель) — только информация, без failover
     s = wait(lambda s: s["connectivity"].get("access_state") == "failed", "проба доступа завершилась (в песочнице ответа нет)", 25)
@@ -110,12 +115,29 @@ try:
     time.sleep(6)
     s = status()
     check(s["connected"] and s["active_profile"] == "p1" and s["reconnects"] == 0, "неудачная проба по умолчанию НЕ вызывает failover")
-    check(s["workers"]["configured"] == 6, "workers.configured из конфига")
+    want_workers = 10 if MODE == "modern" else 6   # 2.5.0: число воркеров сообщает ядро (событие WORKERS)
+    check(s["workers"]["configured"] == want_workers, f"workers.configured = {want_workers}")
     check(any(p["id"] == "p1" and p["state"] == "active" for p in s["profiles"]), "p1 в состоянии active")
     check("got tun fd, ifname_ok=True" in open(flog).read(), "ядро получило дескриптор TUN")
-    check("dev=dev-it-1" in open(flog).read() and "vk=hashA,hashB" in open(flog).read(), "общие настройки переданы ядру")
+    lg = open(flog).read()
+    check("vk=hashA,hashB" in lg and "pw=pw-p1 " in lg, "хеши и пароль профиля переданы ядру")
+    if MODE == "modern":
+        check("pwenv=1" in lg and "devarg=0" in lg, "ядро 2.5.0: пароль через CSQTT_PASSWORD, без --device-id")
+        check("srtp=auto" in lg and "obfs=unified" in lg, "ядро 2.5.0: --srtp-mode auto, обфускация по умолчанию unified")
+    else:
+        check("pwenv=0" in lg and "dev=dev-it-1" in lg, "старое ядро: --password и --device-id аргументами")
     r = subprocess.run([BIN, "status", "--status-path", stp], capture_output=True, text=True)
     check(r.returncode == 0, f"csqtt status → 0 (подключён): {r.stdout.strip()[:60]}")
+
+    # ---- 1b. смена пароля профиля применяется (отпечаток учитывает окружение) без ручного перезапуска
+    write_cfg(pw_suffix="X"); proc.send_signal(signal.SIGHUP)
+    t0 = time.time()
+    while "pw=pw-p1X " not in open(flog).read() and time.time() - t0 < 15:
+        time.sleep(0.3)
+    check("pw=pw-p1X " in open(flog).read(), "после смены пароля ядро перезапущено с новым паролем")
+    wait(lambda s: s.get("connected") and s["active_profile"] == "p1", "переподключение с новым паролем")
+    write_cfg(); proc.send_signal(signal.SIGHUP); time.sleep(1.5)
+    wait(lambda s: s.get("connected") and s["active_profile"] == "p1", "возврат к исходному паролю")
 
     # ---- 2. failover: p1 помечаем «плохим» (ядро падает с auth), p2 рабочий
     write_cfg(profiles=[("p1", 10, "bad1.example:46000"), ("p2", 20, "good2.example:46000")])
@@ -169,6 +191,21 @@ try:
     check(len(lines) == 2 and '"valid"' in lines[0] and '"invalid"' in lines[1], "--validate-vk-hashes проксирует вывод ядра")
     r = subprocess.run([BIN, "profile", "export", "p1", "--config", cfgp], capture_output=True, text=True)
     check(r.stdout.startswith("csqtt://connect?v=2&host=captcha1.example&peer=46000"), "profile export")
+
+    # ---- 5b. потеря TUN (код 3): интерфейс пересоздаётся, профиль не штрафуется и не переключается
+    write_cfg(profiles=[("p1", 10, "tunlost1.example:46000")])
+    if os.path.exists(MARK): os.remove(MARK)
+    base = status()["reconnects"]
+    proc.send_signal(signal.SIGHUP)
+    t0 = time.time()
+    while "пересоздаю интерфейс" not in open(logp).read() and time.time() - t0 < 25:
+        time.sleep(0.3)
+    lg = open(logp).read()
+    check("tun lost -> exit 3" in open(flog).read(), "ядро сообщило о потере TUN и вышло с кодом 3")
+    check("ядро потеряло TUN (код 3)" in lg and "пересоздаю интерфейс" in lg, "в журнале запись о пересоздании TUN")
+    s = wait(lambda s: s.get("connected") and s["active_profile"] == "p1" and s["reconnects"] >= base + 2, "переподключение после потери TUN", 25)
+    check(next(p for p in s["profiles"] if p["id"] == "p1")["fails"] == 0, "потеря TUN не засчитана как сбой профиля")
+    check(s["tunnel"]["present"] and s["connectivity"]["tun_present"], "TUN пересоздан")
 
     # ---- 6. корректная остановка
     proc.send_signal(signal.SIGTERM)

@@ -4,7 +4,8 @@
 #   - интерфейс csqtt0 фиксирован (не UCI-поле);
 #   - runtime-состояние — только /var/run/csqtt/status.json, никогда здесь;
 #   - секреты (password, vk_js_token) через статусы/LuCI не выдаются;
-#   - device_id привязан к паролю на сервере — переносить как есть, не генерировать.
+#   - device_id (только для ядра ≤ 2.1.x) привязан к паролю на сервере — переносить как есть, не генерировать;
+#     ядро 2.5.0+ его не использует, пароль передаёт через окружение (не виден в ps).
 # Профили удобнее добавлять CLI: csqtt profile import 'csqtt://…' --commit
 # (или секцией config server ниже вручную).
 
@@ -32,6 +33,25 @@ config csqtt 'main'
 	option log_level 'info'
 	option log_file '/var/log/csqtt.log'
 	option log_size_kb '512'
+	# --- Настройки ядра 2.5.0+ (не заданы = значения по умолчанию ядра). Можно задать здесь (общие)
+	# --- или в секции профиля (переопределяют общие). В панели LuCI пока не отображаются.
+	# option obfs 'unified'            # audio | video | unified (по умолчанию unified; у 2.1.x — audio)
+	# option turn_transport 'udp'      # udp | tcp
+	# option srtp_mode 'auto'          # auto | wrap | dtls
+	# option workers '30'              # 1..100; ядро округляет до групп по 10 (если не exact_workers)
+	# option exact_workers '0'         # 1 = ровно столько воркеров, без округления
+	# option runtime_threads '0'       # потоки рантайма ядра; 0 = авто
+	# option custom_turn_ips ''        # свои TURN-адреса: "1.2.3.4,5.6.7.8"
+	# Маршрутизация ВНУТРИ ядра (пользовательский сетевой стек — заметно нагружает слабые роутеры):
+	# option domain_routing '0'        # включить маршрутизацию по доменам (SNI)
+	# option domain_whitelist '0'      # 1 = через туннель ТОЛЬКО перечисленные домены, остальное напрямую
+	# option exclude_ru_zones '0'      # домены зон РФ — напрямую (не в режиме whitelist)
+	# option template_domains '0'      # встроенный список доменов (domains.txt) — напрямую (не в whitelist)
+	# option direct_domains ''         # свои домены напрямую: "a.com,b.org" (включает domain_routing)
+	# option domains_file ''           # файлы со списками доменов: "/etc/csqtt/a.txt /etc/csqtt/b.txt"
+	# option ip_routing '0'            # маршрутизация по IP
+	# option ip_whitelist '0'          # 1 = через туннель ТОЛЬКО перечисленные IP/подсети
+	# option direct_ips ''             # свои IP/подсети напрямую: "10.0.0.0/8,1.1.1.1"
 
 # Контракт M3X: auto = interface-only (БЕЗ маршрутов/правил/таблиц — служба CSQTT их
 # не ставит); none — отладочный алиас. Других режимов нет.

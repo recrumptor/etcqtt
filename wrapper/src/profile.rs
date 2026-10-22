@@ -66,6 +66,11 @@ pub struct ImportOpts {
 }
 
 pub fn import(config: &str, raw: &str, o: &ImportOpts) -> Result<String, String> {
+    import_with(config, raw, o, crate::supervisor::core_modern())
+}
+
+/// `modern` = ядро 2.5.0+: device_id не используется и не создаётся.
+pub fn import_with(config: &str, raw: &str, o: &ImportOpts, modern: bool) -> Result<String, String> {
     let l = link::parse(raw)?;
     let mut cfg = load(config)?;
     let id = match &o.id {
@@ -103,7 +108,7 @@ pub fn import(config: &str, raw: &str, o: &ImportOpts) -> Result<String, String>
         }
     }
     // device_id привязан к паролю на сервере: создаём один раз и дальше не меняем
-    if cfg.shared(&cfg.main(), "device_id").is_empty() {
+    if !modern && cfg.shared(&cfg.main(), "device_id").is_empty() {
         let dev = util::uuid_v4();
         if o.commit {
             cfg.set_option("main", "device_id", &dev);
@@ -162,11 +167,11 @@ mod tests {
     fn import_use_export_remove() {
         let p = tmp(BASE);
         let o = ImportOpts { id: None, name: None, activate: false, vk_to_shared: false, commit: false };
-        let r = import(&p, "csqtt://connect?v=2&host=h.example&peer=46000&password=s3&hashes=a+b", &o).unwrap();
+        let r = import_with(&p, "csqtt://connect?v=2&host=h.example&peer=46000&password=s3&hashes=a+b", &o, false).unwrap();
         assert!(r.contains("dry-run"));
         assert!(Config::load(&p).unwrap().servers().is_empty());
         let o = ImportOpts { commit: true, activate: true, ..o };
-        import(&p, "csqtt://connect?v=2&host=h.example&peer=46000&password=s3&hashes=a+b", &o).unwrap();
+        import_with(&p, "csqtt://connect?v=2&host=h.example&peer=46000&password=s3&hashes=a+b", &o, false).unwrap();
         let c = Config::load(&p).unwrap();
         let s = c.server("profile1").unwrap();
         assert_eq!(s.get("peer"), "h.example:46000");
@@ -182,6 +187,16 @@ mod tests {
         assert!(Config::load(&p).unwrap().server("profile1").is_none());
         assert!(action(&p, "use", Some("nope")).is_err());
         assert!(action(&p, "use", Some("bad id!")).is_err());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn modern_import_creates_no_device_id() {
+        let p = tmp(BASE);
+        let o = ImportOpts { id: None, name: None, activate: false, vk_to_shared: false, commit: true };
+        let msg = import_with(&p, "csqtt://connect?v=2&host=h.example&peer=46000&password=s3&hashes=a", &o, true).unwrap();
+        assert!(!msg.contains("device_id"));
+        assert_eq!(Config::load(&p).unwrap().main().get("device_id"), "");
         std::fs::remove_file(p).ok();
     }
 }

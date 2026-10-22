@@ -23,7 +23,15 @@ if "--validate-vk-hashes" in args:
     sys.exit(0)
 
 peer, uds, vk = opt("--peer"), opt("--tun-uds"), opt("--vk")
-log(f"start peer={peer} captcha_mode={opt('--captcha-mode')} vk={vk} dev={opt('--device-id')} n={opt('-n')}")
+MODE = os.environ.get("FAKE_MODE", "legacy")   # modern = ядро 2.5.0+: пароль только в окружении
+pw_env = os.environ.get("CSQTT_PASSWORD", "")
+pw = pw_env or opt("--password")
+log(f"start peer={peer} captcha_mode={opt('--captcha-mode')} vk={vk} dev={opt('--device-id')} n={opt('-n')} pw={pw} pwenv={1 if pw_env else 0} devarg={1 if '--device-id' in args else 0} obfs={opt('--obfs')} srtp={opt('--srtp-mode')}")
+if MODE == "modern" and ("--password" in args or "--device-id" in args):
+    # как clap в ядре 2.5.0: таких аргументов больше нет
+    sys.stderr.write("error: unexpected argument '--password' found\n"); sys.exit(2)
+if MODE == "modern" and not pw_env:
+    sys.stderr.write("[ФАТАЛ] [КЛИЕНТ] Нужен пароль в переменной CSQTT_PASSWORD\n"); sys.exit(1)
 stop = threading.Event()
 captcha_result = []
 bootstrap = []
@@ -69,7 +77,15 @@ if "captcha" in peer:
 
 # как настоящее ядро: сервер выдаёт клиенту адрес туннеля (TUNCONF) до начала передачи данных
 ev("CONFIG", config="TUNCONF:10.255.88.9:1.1.1.1")
+if MODE == "modern":
+    ev("WORKERS", workers=10)   # ядро 2.5.0 само округляет число воркеров до групп по 10
 ev("READY", worker=1)
+if "tunlost" in peer:
+    mark = os.environ.get("FAKE_MARK", "/tmp/fake_tunlost.mark")
+    if not os.path.exists(mark):
+        open(mark, "w").close()
+        time.sleep(1.0)
+        ev("TUN_LOST"); log("tun lost -> exit 3"); sys.exit(3)
 sent = 0
 while not stop.is_set():
     sent += 1000

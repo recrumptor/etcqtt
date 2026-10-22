@@ -44,7 +44,8 @@ jobs:
         run: |
           sudo modprobe tun || true
           sudo test -c /dev/net/tun
-          sudo python3 tests/integration.py
+          sudo env CORE_MODE=modern python3 tests/integration.py   # ядро 2.5.0+: пароль через окружение
+          sudo env CORE_MODE=legacy python3 tests/integration.py   # ядро 2.1.x: аргументы --password/--device-id
 
   check-version:
     runs-on: ubuntu-latest
@@ -175,6 +176,21 @@ jobs:
           git clone --depth 1 --branch "${{ needs.check-version.outputs.core_ref }}" \
             https://github.com/${CORE_REPO}.git source
 
+      # В теге v2.5.0 нет корневого domains.txt, а sni.rs подключает его через include_str!("../domains.txt")
+      # (файл добавлен на main уже после тега). Тот же файл лежит в ассетах Android-приложения — берём оттуда.
+      - name: Provide domains.txt (missing in tag v2.5.0)
+        run: |
+          cd source
+          if [ ! -f domains.txt ]; then
+            if [ -f app/src/main/assets/domains.txt ]; then
+              cp app/src/main/assets/domains.txt domains.txt
+              echo "domains.txt взят из app/src/main/assets/"
+            else
+              echo "::error::в исходниках нет domains.txt — сборка ядра невозможна"
+              exit 1
+            fi
+          fi
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.rust_target }}
@@ -188,7 +204,9 @@ jobs:
         run: |
           cd source
           P="$GITHUB_WORKSPACE/patches/core-musl-udp-batch.patch"
-          if git apply --check "$P" 2>/dev/null; then
+          if [ ! -f rust-client/udp_batch.rs ]; then
+            echo "udp_batch.rs отсутствует (ядро 2.5.0+) — патч не нужен"
+          elif git apply --check "$P" 2>/dev/null; then
             git apply "$P" && echo "патч применён"
           elif git apply --reverse --check "$P" 2>/dev/null; then
             echo "патч уже применён в исходниках — пропускаем"
@@ -273,7 +291,7 @@ jobs:
   package:
     name: pkg (${{ matrix.openwrt_ver }}, ${{ matrix.pkg_arch }})
     needs: [check-version, build-bin]
-    if: ${{ !cancelled() && (needs.check-version.outputs.exists == 'false' || inputs.test_build) && needs.build-bin.result != 'skipped' }}
+    if: ${{ !cancelled() && (needs.check-version.outputs.exists == 'false' || inputs.test_build) && needs.build-bin.result == 'success' }}
     runs-on: ubuntu-latest
     continue-on-error: ${{ matrix.experimental }}
     strategy:

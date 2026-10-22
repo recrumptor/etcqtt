@@ -21,6 +21,29 @@ pub fn version_string() -> String {
     format!("{} (core {})", VERSION, CORE_VERSION)
 }
 
+fn parse_ver(s: &str) -> Option<(u32, u32, u32)> {
+    let mut it = s.trim().trim_start_matches('v').split(|c: char| !c.is_ascii_digit());
+    let a = it.next()?.parse().ok()?;
+    let b = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let c = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    Some((a, b, c))
+}
+
+/// Версия ядра: переменная окружения CSQTT_CORE_VERSION (переопределение) либо зашитая при сборке.
+/// Неизвестная версия считается самой новой.
+pub fn core_version() -> (u32, u32, u32) {
+    std::env::var("CSQTT_CORE_VERSION").ok().as_deref().and_then(parse_ver).or_else(|| parse_ver(CORE_VERSION)).unwrap_or((99, 0, 0))
+}
+
+/// Ядро 2.5.0+: пароль передаётся переменной CSQTT_PASSWORD, флагов --password/--device-id нет.
+pub fn core_modern() -> bool {
+    core_version() >= (2, 5, 0)
+}
+
+fn truthy(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on" | "enabled")
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(150);
 const STATUS_EVERY: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(200);
@@ -132,10 +155,15 @@ pub fn normalize_hashes(s: &str) -> String {
     s.split(|c: char| c == ',' || c == ';' || c == '+' || c.is_whitespace()).map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().join(",")
 }
 
-/// Эффективные транспорт и обфускация профиля (с учётом общих настроек и значений по умолчанию ядра).
-pub fn effective_settings(cfg: &Config, prof: &Section) -> (String, String) {
+/// Эффективные транспорт и обфускация профиля (общие настройки + значения по умолчанию ядра).
+/// По умолчанию обфускация у ядра 2.5.0+ `unified`, у более старых `audio`.
+pub fn effective_settings_for(cfg: &Config, prof: &Section, modern: bool) -> (String, String) {
     let or = |v: String, d: &str| if v.is_empty() { d.to_string() } else { v };
-    (or(cfg.shared(prof, "turn_transport"), "udp"), or(cfg.shared(prof, "obfs"), "audio"))
+    (or(cfg.shared(prof, "turn_transport"), "udp"), or(cfg.shared(prof, "obfs"), if modern { "unified" } else { "audio" }))
+}
+
+pub fn effective_settings(cfg: &Config, prof: &Section) -> (String, String) {
+    effective_settings_for(cfg, prof, core_modern())
 }
 
 /// Текущий MTU интерфейса из sysfs (None, если интерфейса нет).
@@ -143,8 +171,28 @@ fn iface_mtu(name: &str) -> Option<u32> {
     std::fs::read_to_string(format!("/sys/class/net/{}/mtu", name)).ok()?.trim().parse().ok()
 }
 
-/// Аргументы ядра для профиля. Чистая функция — покрыта тестами.
-pub fn core_args(cfg: &Config, prof: &Section, uds: &str) -> Result<Vec<String>, String> {
+/// Команда запуска ядра: аргументы и переменные окружения.
+#[derive(Debug, Clone)]
+pub struct CoreCmd {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Список доменов/адресов через запятую (разделители: запятая, `;`, пробел, перевод строки).
+pub fn normalize_list(s: &str) -> String {
+    s.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>().join(",")
+}
+
+/// Маршрутизация по доменам/IP внутри ядра (2.5.0+) включена?
+pub fn routing_active(cfg: &Config, prof: &Section) -> bool {
+    let g = |k: &str| cfg.shared(prof, k);
+    truthy(&g("domain_routing")) || truthy(&g("exclude_ru_zones")) || truthy(&g("template_domains")) || !normalize_list(&g("direct_domains")).is_empty()
+        || truthy(&g("ip_routing")) || !normalize_list(&g("direct_ips")).is_empty()
+}
+
+/// Команда ядра для профиля. Чистая функция — покрыта тестами.
+/// `modern` = ядро 2.5.0+: пароль в окружении, без --device-id, новые настройки маршрутизации.
+pub fn core_cmd(cfg: &Config, prof: &Section, uds: &str, modern: bool) -> Result<CoreCmd, String> {
     let g = |k: &str| cfg.shared(prof, k);
     let peer = prof.get("peer").trim().to_string();
     let password = prof.get("password").to_string();
@@ -164,17 +212,23 @@ pub fn core_args(cfg: &Config, prof: &Section, uds: &str) -> Result<Vec<String>,
     }
     let or = |v: String, d: &str| if v.is_empty() { d.to_string() } else { v };
     let workers = or(g("workers"), "18");
-    if workers.parse::<usize>().map(|n| n == 0 || n > 126).unwrap_or(true) {
-        return Err("workers: ожидается 1..126".into());
+    // у ядра MAX_WORKERS = 100; ядро само округляет до групп по 10 (если не задан exact_workers)
+    if workers.parse::<usize>().map(|n| n == 0 || n > 100).unwrap_or(true) {
+        return Err("workers: ожидается 1..100".into());
     }
     let mut a: Vec<String> = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
     let mut push = |k: &str, v: String| {
         a.push(k.to_string());
         a.push(v);
     };
     push("--peer", peer);
-    push("--password", password);
-    push("--device-id", or(g("device_id"), "unknown"));
+    if modern {
+        env.push(("CSQTT_PASSWORD".into(), password)); // не светится в `ps`
+    } else {
+        push("--password", password);
+        push("--device-id", or(g("device_id"), "unknown"));
+    }
     push("--vk", vk);
     push("--vk-hash-mode", hash_mode);
     push("--vk-auth-mode", or(g("vk_auth_mode"), "vkcalls"));
@@ -182,17 +236,74 @@ pub fn core_args(cfg: &Config, prof: &Section, uds: &str) -> Result<Vec<String>,
     push("--fingerprint", or(g("fingerprint"), "chrome"));
     push("--client-ids", g("client_ids"));
     push("-n", workers);
-    let (transport, obfs) = effective_settings(cfg, prof);
+    let (transport, obfs) = effective_settings_for(cfg, prof, modern);
     push("--obfs", obfs);
     push("--turn-transport", transport);
     push("--tun-uds", uds.to_string());
-    Ok(a)
+    if modern {
+        push("--srtp-mode", or(g("srtp_mode"), "auto"));
+        let turn_ips = normalize_list(&g("custom_turn_ips"));
+        if !turn_ips.is_empty() {
+            push("--custom-turn-ips", turn_ips);
+        }
+        match g("runtime_threads").trim().parse::<u32>() {
+            Ok(n) if n > 0 => push("--runtime-threads", n.to_string()),
+            _ => {}
+        }
+        // маршрутизация внутри ядра — как у Android-клиента (TunnelManager.kt)
+        let whitelist = truthy(&g("domain_whitelist"));
+        let direct_domains = normalize_list(&g("direct_domains"));
+        let domains_active = truthy(&g("domain_routing")) || truthy(&g("exclude_ru_zones")) || truthy(&g("template_domains")) || !direct_domains.is_empty();
+        let mut flags: Vec<&str> = Vec::new();
+        if truthy(&g("exact_workers")) {
+            flags.push("--exact-workers");
+        }
+        if domains_active {
+            flags.push("--domain-routing");
+            if whitelist {
+                flags.push("--domain-whitelist");
+            }
+            if truthy(&g("exclude_ru_zones")) && !whitelist {
+                flags.push("--exclude-ru-zones");
+            }
+            if truthy(&g("template_domains")) && !whitelist {
+                flags.push("--template-domains");
+            }
+        }
+        let direct_ips = normalize_list(&g("direct_ips"));
+        if truthy(&g("ip_routing")) || !direct_ips.is_empty() {
+            flags.push("--ip-routing");
+            if truthy(&g("ip_whitelist")) {
+                flags.push("--ip-whitelist");
+            }
+        }
+        a.extend(flags.iter().map(|f| f.to_string()));
+        if !direct_domains.is_empty() {
+            a.push("--direct-domains".into());
+            a.push(direct_domains);
+        }
+        if !direct_ips.is_empty() {
+            a.push("--direct-ips".into());
+            a.push(direct_ips);
+        }
+        for f in normalize_list(&g("domains_file")).split(',').filter(|x| !x.is_empty()) {
+            a.push("--domains-file".into());
+            a.push(f.to_string());
+        }
+        env.push(("RAYON_NUM_THREADS".into(), or(g("rayon_threads"), "2")));
+    }
+    Ok(CoreCmd { args: a, env })
+}
+
+/// Аргументы ядра (для проверок полноты профиля).
+pub fn core_args(cfg: &Config, prof: &Section, uds: &str) -> Result<Vec<String>, String> {
+    core_cmd(cfg, prof, uds, core_modern()).map(|c| c.args)
 }
 
 /// Отпечаток параметров профиля: изменился → сессию надо перезапустить.
 fn fingerprint(cfg: &Config, prof: &Section) -> String {
-    match core_args(cfg, prof, "x") {
-        Ok(a) => a.join("\u{1}"),
+    match core_cmd(cfg, prof, "x", core_modern()) {
+        Ok(c) => format!("{}\u{2}{}", c.args.join("\u{1}"), c.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\u{1}")),
         Err(e) => format!("ERR:{}", e),
     }
 }
@@ -250,6 +361,9 @@ struct Session {
     tun_deadline: Instant,
     client_ip: Option<std::net::Ipv4Addr>,
     dns: String,
+    workers_total: Option<u32>,
+    tun_lost: bool,
+    routing: Option<Value>,
 }
 
 struct Sup {
@@ -281,6 +395,8 @@ struct Sup {
     cpu_prev: Option<(u64, Instant)>,
     cpu_pct: f64,
     last_ifname: String,
+    tun_lost_streak: u32,
+    last_tun_lost: Instant,
 }
 
 fn build_pool(cfg: &Config, old: &[Prof]) -> Vec<Prof> {
@@ -342,6 +458,8 @@ pub fn run(opts: Opts) -> i32 {
         prev_mode: set.mode.clone(),
         prev_active: set.active_profile.clone(),
         last_ifname: set.ifname.clone(),
+        tun_lost_streak: 0,
+        last_tun_lost: Instant::now(),
         opts,
         cfg,
         set,
@@ -506,8 +624,8 @@ impl Sup {
             return;
         }
         let uds = format!("csqtt-tun-{}", std::process::id());
-        let args = match core_args(&self.cfg, &sec, &uds) {
-            Ok(a) => a,
+        let cmd = match core_cmd(&self.cfg, &sec, &uds, core_modern()) {
+            Ok(c) => c,
             Err(e) => {
                 self.mark_failed(id, &e, "failed");
                 self.last_error = format!("{}: {}", id, e);
@@ -517,7 +635,7 @@ impl Sup {
         let auto_js = self.cfg.shared(&sec, "vk_hash_mode") == "auto_js";
         let bin = core_bin();
         logi!("запуск ядра для профиля {} ({}), причина: {}", id, sec.get_or("name", id), reason);
-        let mut core = match Core::spawn(&bin, &args, true) {
+        let mut core = match Core::spawn(&bin, &cmd.args, &cmd.env, true) {
             Ok(c) => c,
             Err(e) => {
                 let m = format!("не удалось запустить {}: {}", bin, e);
@@ -572,6 +690,9 @@ impl Sup {
             tun_deadline: now + Duration::from_secs(15),
             client_ip: None,
             dns: String::new(),
+            workers_total: None,
+            tun_lost: false,
+            routing: None,
         });
         self.set_pool_state(id, "");
         self.last_error.clear();
@@ -759,6 +880,19 @@ impl Sup {
                             logd!("ядро: CONFIG {}", data);
                         }
                     }
+                    "WORKERS" => {
+                        s.workers_total = data["workers"].as_u64().map(|n| n as u32);
+                        logd!("ядро: воркеров {}", data["workers"]);
+                    }
+                    "TUN_LOST" => {
+                        s.tun_lost = true;
+                        logw!("ядро сообщило о потере TUN");
+                    }
+                    "ROUTING" => {
+                        s.routing = data["routing"].as_str().and_then(|j| serde_json::from_str(j).ok()).or_else(|| Some(data["routing"].clone()));
+                        logd!("ядро: маршрутизация {}", data["routing"]);
+                    }
+                    "DTLS" => logd!("ядро: DTLS {}", data),
                     "STOPPED" => logi!("ядро сообщило STOPPED"),
                     "SERVER_RESTART" | "NETWORK_SUSPECT" | "PROGRESS" | "PROCESS" => logd!("ядро: {} {}", kind, data),
                     _ => logd!("ядро: событие {} {}", kind, data),
@@ -896,6 +1030,23 @@ impl Sup {
             self.pump_messages();
             if self.sess.is_none() {
                 return;
+            }
+            // код 3 / событие TUN_LOST: потерян интерфейс, а не сервер → пересоздаём TUN, профиль не штрафуем
+            let tun_lost = code == 3 || self.sess.as_ref().map(|s| s.tun_lost).unwrap_or(false);
+            if tun_lost {
+                if self.last_tun_lost.elapsed() > Duration::from_secs(120) {
+                    self.tun_lost_streak = 0;
+                }
+                self.last_tun_lost = Instant::now();
+                self.tun_lost_streak += 1;
+                if self.tun_lost_streak <= 3 {
+                    logw!("ядро потеряло TUN (код {}): пересоздаю интерфейс, попытка {}", code, self.tun_lost_streak);
+                    self.stop_session(false);
+                    self.tun = None;
+                    self.next_reason = "retry";
+                    self.retry_at = Instant::now() + Duration::from_secs(2);
+                    return;
+                }
             }
             return self.fail_session(format!("ядро завершилось (код {})", code), "fail");
         }
@@ -1110,6 +1261,7 @@ impl Sup {
             .and_then(|p| self.cfg.server(&p.id))
             .map(|sec| self.cfg.shared(&sec, "workers").parse::<i64>().unwrap_or(18))
             .unwrap_or(0);
+        let configured_workers = self.sess.as_ref().and_then(|s| s.workers_total).map(|n| n as i64).unwrap_or(configured_workers);
         let profiles: Vec<Value> = self
             .pool
             .iter()
@@ -1150,6 +1302,9 @@ impl Sup {
             st["vk_hashes"] = self.vk_hashes_json(&sec);
             let (transport, obfs) = effective_settings(&self.cfg, &sec);
             st["effective"] = json!({"turn_transport": transport, "obfs": obfs});
+            if let Some(r) = self.sess.as_ref().and_then(|s| s.routing.clone()) {
+                st["routing"] = r;
+            }
         }
         if st["auto_api"].is_null() {
             st.as_object_mut().unwrap().remove("auto_api");
@@ -1349,42 +1504,91 @@ mod tests {
     const CFG: &str = "config csqtt 'main'\n\toption enabled '1'\n\toption vk 'h1,h2'\n\toption device_id 'dev-1'\n\toption workers '12'\n\nconfig server 'p1'\n\toption name 'A'\n\toption enabled '1'\n\toption priority '10'\n\toption peer '203.0.113.7:46000'\n\toption password 'secret'\n\nconfig server 'p2'\n\toption enabled '1'\n\toption priority '20'\n\toption peer '203.0.113.8:46000'\n";
 
     #[test]
-    fn args_ok_and_errors() {
+    fn args_legacy_core() {
         let cfg = Config::parse(CFG);
-        let a = core_args(&cfg, &cfg.server("p1").unwrap(), "u").unwrap();
-        let s = a.join(" ");
-        assert!(s.contains("--peer 203.0.113.7:46000"));
-        assert!(s.contains("--vk h1,h2"));
-        assert!(s.contains("--device-id dev-1"));
-        assert!(s.contains("-n 12"));
-        assert!(s.contains("--captcha-mode auto"));
+        let c = core_cmd(&cfg, &cfg.server("p1").unwrap(), "u", false).unwrap();
+        let s = c.args.join(" ");
+        assert!(s.contains("--peer 203.0.113.7:46000") && s.contains("--password secret") && s.contains("--device-id dev-1"));
+        assert!(s.contains("--vk h1,h2") && s.contains("-n 12") && s.contains("--captcha-mode auto") && s.contains("--obfs audio"));
         assert!(s.ends_with("--tun-uds u"));
-        assert!(core_args(&cfg, &cfg.server("p2").unwrap(), "u").unwrap_err().contains("password"));
+        assert!(!s.contains("--srtp-mode") && c.env.is_empty());
+        assert!(core_cmd(&cfg, &cfg.server("p2").unwrap(), "u", false).unwrap_err().contains("password"));
+    }
+
+    #[test]
+    fn args_modern_core() {
+        let cfg = Config::parse(CFG);
+        let c = core_cmd(&cfg, &cfg.server("p1").unwrap(), "u", true).unwrap();
+        let s = c.args.join(" ");
+        // пароль только в окружении; --password и --device-id ядро 2.5.0 не принимает
+        assert!(!s.contains("--password") && !s.contains("secret") && !s.contains("--device-id"));
+        assert!(c.env.contains(&("CSQTT_PASSWORD".to_string(), "secret".to_string())));
+        assert!(s.contains("--srtp-mode auto") && s.contains("--obfs unified") && s.contains("--turn-transport udp"));
+        assert!(!s.contains("--domain-routing") && !s.contains("--ip-routing") && !s.contains("--exact-workers"));
+        assert!(c.env.iter().any(|(k, v)| k == "RAYON_NUM_THREADS" && v == "2"));
+    }
+
+    #[test]
+    fn modern_routing_options() {
+        let t = CFG.replace("option workers '12'", "option workers '30'\n\toption exact_workers '1'\n\toption srtp_mode 'dtls'\n\toption custom_turn_ips '1.2.3.4; 5.6.7.8'\n\toption runtime_threads '2'\n\toption domain_routing '1'\n\toption exclude_ru_zones '1'\n\toption template_domains '1'\n\toption direct_domains 'a.com, b.org; c.net'\n\toption domains_file '/etc/x.txt /etc/y.txt'\n\toption ip_routing '1'\n\toption ip_whitelist '1'\n\toption direct_ips '10.0.0.0/8,1.1.1.1'");
+        let cfg = Config::parse(&t);
+        let a = core_cmd(&cfg, &cfg.server("p1").unwrap(), "u", true).unwrap().args.join(" ");
+        for want in ["-n 30", "--exact-workers", "--srtp-mode dtls", "--custom-turn-ips 1.2.3.4,5.6.7.8", "--runtime-threads 2", "--domain-routing", "--exclude-ru-zones", "--template-domains", "--direct-domains a.com,b.org,c.net", "--domains-file /etc/x.txt", "--domains-file /etc/y.txt", "--ip-routing", "--ip-whitelist", "--direct-ips 10.0.0.0/8,1.1.1.1"] {
+            assert!(a.contains(want), "нет {:?} в {}", want, a);
+        }
+        assert!(!a.contains("--domain-whitelist"));
+        assert!(routing_active(&cfg, &cfg.server("p1").unwrap()));
+        // белый список: шаблонные домены и зоны РФ не передаются (как у Android-клиента)
+        let w = Config::parse(&t.replace("option domain_routing '1'", "option domain_routing '1'\n\toption domain_whitelist '1'"));
+        let aw = core_cmd(&w, &w.server("p1").unwrap(), "u", true).unwrap().args.join(" ");
+        assert!(aw.contains("--domain-whitelist") && !aw.contains("--exclude-ru-zones") && !aw.contains("--template-domains"));
+        // direct_domains без явного domain_routing включает маршрутизацию
+        let d = Config::parse(&CFG.replace("option workers '12'", "option direct_domains 'x.org'"));
+        let ad = core_cmd(&d, &d.server("p1").unwrap(), "u", true).unwrap().args.join(" ");
+        assert!(ad.contains("--domain-routing") && ad.contains("--direct-domains x.org"));
+        let big = Config::parse(&CFG.replace("'12'", "'101'"));
+        assert!(core_cmd(&big, &big.server("p1").unwrap(), "u", true).is_err());
+    }
+
+    #[test]
+    fn version_parsing() {
+        assert_eq!(parse_ver("2.5.0"), Some((2, 5, 0)));
+        assert_eq!(parse_ver("v2.1.9"), Some((2, 1, 9)));
+        assert_eq!(parse_ver("2.10"), Some((2, 10, 0)));
+        assert_eq!(parse_ver("unknown"), None);
+        assert!((2, 5, 0) > (2, 1, 9) && (2, 10, 0) > (2, 5, 0));
+    }
+
+    #[test]
+    fn password_change_changes_fingerprint() {
+        let cfg = Config::parse(CFG);
+        let f1 = fingerprint(&cfg, &cfg.server("p1").unwrap());
+        let cfg2 = Config::parse(&CFG.replace("'secret'", "'other'"));
+        assert_ne!(f1, fingerprint(&cfg2, &cfg2.server("p1").unwrap()));
     }
 
     #[test]
     fn auto_js_requires_token() {
         let t = CFG.replace("option vk 'h1,h2'", "option vk_hash_mode 'auto_js'");
         let cfg = Config::parse(&t);
-        assert!(core_args(&cfg, &cfg.server("p1").unwrap(), "u").unwrap_err().contains("vk_js_token"));
+        assert!(core_cmd(&cfg, &cfg.server("p1").unwrap(), "u", true).unwrap_err().contains("vk_js_token"));
         let t2 = t.replace("option device_id", "option vk_js_token 'T'\n\toption device_id");
         let cfg2 = Config::parse(&t2);
-        assert!(core_args(&cfg2, &cfg2.server("p1").unwrap(), "u").is_ok());
+        assert!(core_cmd(&cfg2, &cfg2.server("p1").unwrap(), "u", true).is_ok());
     }
 
     #[test]
     fn effective_defaults_and_overrides() {
         let cfg = Config::parse(CFG);
         let sec = cfg.server("p1").unwrap();
-        assert_eq!(effective_settings(&cfg, &sec), ("udp".to_string(), "audio".to_string()));
-        let a = core_args(&cfg, &sec, "u").unwrap().join(" ");
-        assert!(a.contains("--turn-transport udp") && a.contains("--obfs audio"));
+        assert_eq!(effective_settings_for(&cfg, &sec, false), ("udp".to_string(), "audio".to_string()));
+        assert_eq!(effective_settings_for(&cfg, &sec, true), ("udp".to_string(), "unified".to_string()));
         let t = CFG.replace("option workers '12'", "option workers '12'\n\toption turn_transport 'tcp'");
         let cfg2 = Config::parse(&t);
-        assert_eq!(effective_settings(&cfg2, &cfg2.server("p1").unwrap()).0, "tcp");
-        let t3 = t.replace("option password 'secret'", "option password 'secret'\n\toption obfs 'none'");
+        assert_eq!(effective_settings_for(&cfg2, &cfg2.server("p1").unwrap(), true).0, "tcp");
+        let t3 = t.replace("option password 'secret'", "option password 'secret'\n\toption obfs 'video'");
         let cfg3 = Config::parse(&t3);
-        assert_eq!(effective_settings(&cfg3, &cfg3.server("p1").unwrap()), ("tcp".to_string(), "none".to_string()));
+        assert_eq!(effective_settings_for(&cfg3, &cfg3.server("p1").unwrap(), true), ("tcp".to_string(), "video".to_string()));
     }
 
     #[test]

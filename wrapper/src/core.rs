@@ -51,9 +51,12 @@ pub struct Core {
 }
 
 impl Core {
-    pub fn spawn(bin: &str, args: &[String], events: bool) -> std::io::Result<Core> {
+    pub fn spawn(bin: &str, args: &[String], env: &[(String, String)], events: bool) -> std::io::Result<Core> {
         let mut cmd = Command::new(bin);
         cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         if events {
             cmd.env("CSQTT_EVENTS", "1");
         }
