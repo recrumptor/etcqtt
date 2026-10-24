@@ -14,6 +14,10 @@ on:
         description: 'Сжимать бинарники UPX (все архитектуры; без галки — не сжимать)'
         type: boolean
         default: false
+      udp_pin_fix:
+        description: 'Патч small-UDP pin (ускоряет отдачу UDP/QUIC; сторонний, не в upstream; только ядро 2.5.0)'
+        type: boolean
+        default: false
       core_ref:
         description: 'Тег/ветка ядра upstream (пусто = последний релиз)'
         type: string
@@ -214,6 +218,20 @@ jobs:
             echo "::warning::patches/core-musl-udp-batch.patch не применяется к ${{ needs.check-version.outputs.core_ref }} — собираем без него (возможна ошибка компиляции под musl)"
           fi
 
+      # Необязательный патч скорости (PR ttrroyy/csqttr#2, автор SanityProtocol): small-UDP pin держит поток на одном
+      # стриме, только пока он помещается в один стрим. Только клиент (uplink), только ядро 2.5.0. См. patches/.
+      - name: Apply small-UDP pin fix (optional)
+        if: ${{ inputs.udp_pin_fix }}
+        run: |
+          cd source
+          P="$GITHUB_WORKSPACE/patches/core-small-udp-pin.patch"
+          if git apply --check "$P" 2>/dev/null; then
+            git apply "$P" && echo "патч small-UDP pin применён"
+          else
+            echo "::error::patches/core-small-udp-pin.patch не применяется к ${{ needs.check-version.outputs.core_ref }} (рассчитан на v2.5.0)"
+            exit 1
+          fi
+
       # mips32 не имеет 64-битных атомиков в std (AtomicU64/AtomicI64) — подменяем на portable-atomic.
       - name: Patch core for 64-bit atomics (mips32)
         if: ${{ matrix.rust_target == 'mipsel-unknown-linux-musl' }}
@@ -359,7 +377,8 @@ jobs:
           make defconfig
           make package/csqtt/compile V=s -j$(nproc)
           mkdir -p ../output-artifacts
-          OUT="csqtt-${{ needs.check-version.outputs.ver }}-r${{ needs.check-version.outputs.rel }}-${{ matrix.pkg_arch }}-v${{ matrix.openwrt_ver }}.${{ matrix.pkg_ext }}"
+          TAG=""; [ "${{ inputs.udp_pin_fix }}" = "true" ] && TAG="-udppin"   # сборка с патчем small-UDP pin
+          OUT="csqtt-${{ needs.check-version.outputs.ver }}-r${{ needs.check-version.outputs.rel }}${TAG}-${{ matrix.pkg_arch }}-v${{ matrix.openwrt_ver }}.${{ matrix.pkg_ext }}"
           F=$(find bin/ -name "csqtt[_-]*.${{ matrix.pkg_ext }}" | head -n1)
           [ -n "$F" ] || { echo "пакет не найден"; exit 1; }
           cp "$F" "../output-artifacts/$OUT"
