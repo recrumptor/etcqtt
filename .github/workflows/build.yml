@@ -289,8 +289,12 @@ jobs:
           file out/csqtt out/csqtt-core
           printf "config server 'x'\n\toption peer 'a:1'\n\toption password 'p'\n" > /tmp/smoke.cfg
           $RUN ./out/csqtt version
-          # разбор конфига с секцией (на этом падал static-PIE): ожидаем ссылку и код 0
-          $RUN ./out/csqtt profile export x --config /tmp/smoke.cfg | grep -q '^csqtt://connect'
+          # разбор конфига с секцией (на этом падал static-PIE): экспорт ссылки (ядро 2.5.0+ — зашифрованная,
+          # более старое — открытая) и импорт её обратно
+          LINK=$($RUN ./out/csqtt profile export x --config /tmp/smoke.cfg)
+          echo "$LINK" | grep -q '^csqtt://'
+          : > /tmp/smoke-import.cfg
+          $RUN ./out/csqtt profile import "$LINK" --config /tmp/smoke-import.cfg | grep -q 'peer a:1'
           # ядро без аргументов: допустима ошибка clap (код < 128) или таймаут, но не сигнал
           rc=0; timeout 20 $RUN ./out/csqtt-core >/dev/null 2>&1 || rc=$?
           echo "csqtt-core rc=$rc"

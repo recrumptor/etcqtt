@@ -78,6 +78,11 @@ fn main() {
 }
 
 fn real_main(argv: Vec<String>) -> i32 {
+    // CLI-команды в конвейере (`csqtt … | head`) должны молча завершаться при закрытой трубе, как обычные утилиты;
+    // иначе println! паникует. Служба (`run`) сама игнорирует SIGPIPE — см. supervisor::install_signals.
+    if argv.first().map(|s| s.as_str()) != Some("run") {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let a = Args::parse(&argv, VALUED);
     if a.has("validate-vk-hashes") {
         return validate_hashes_cli(&a);
