@@ -166,6 +166,27 @@ pub fn effective_settings(cfg: &Config, prof: &Section) -> (String, String) {
     effective_settings_for(cfg, prof, core_modern())
 }
 
+/// Воркеры и группы ядра 2.5.0+: workers округляется вниз до десятков (10..100), группа = 10 воркеров;
+/// с `exact_workers` — ровно столько (3..100). Возвращает (воркеров, групп). Группа i берёт хеш i % число_хешей.
+pub fn worker_groups(requested: usize, exact: bool) -> (usize, usize) {
+    const GROUP: usize = 10;
+    const MAX: usize = 100;
+    let w = if exact { requested.clamp(3, MAX) } else { requested.clamp(GROUP, MAX) / GROUP * GROUP };
+    (w, w.div_ceil(GROUP))
+}
+
+/// Профили, у которых групп воркеров меньше, чем хешей: лишние хеши не используются (ядро 2.5.0+).
+pub fn hash_coverage(cfg: &Config, prof: &Section) -> Option<(usize, usize, usize)> {
+    let g = |k: &str| cfg.shared(prof, k);
+    let requested: usize = if g("workers").is_empty() { 18 } else { g("workers").parse().ok()? };
+    let hashes = normalize_hashes(&g("vk")).split(',').filter(|x| !x.is_empty()).count().min(6);
+    if hashes == 0 {
+        return None;
+    }
+    let (workers, groups) = worker_groups(requested, truthy(&g("exact_workers")));
+    if groups < hashes { Some((workers, groups, hashes)) } else { None }
+}
+
 /// Текущий MTU интерфейса из sysfs (None, если интерфейса нет).
 fn iface_mtu(name: &str) -> Option<u32> {
     std::fs::read_to_string(format!("/sys/class/net/{}/mtu", name)).ok()?.trim().parse().ok()
@@ -237,6 +258,16 @@ pub fn core_cmd(cfg: &Config, prof: &Section, uds: &str, modern: bool) -> Result
     push("--client-ids", g("client_ids"));
     push("-n", workers);
     let (transport, obfs) = effective_settings_for(cfg, prof, modern);
+    // понятная ошибка вместо фатальной в ядре: у 2.1.x режима unified нет
+    if !(matches!(obfs.as_str(), "audio" | "video") || (modern && obfs == "unified")) {
+        return Err(format!("obfs '{}' не поддерживается этим ядром ({})", obfs, if modern { "допустимо: audio, video, unified" } else { "допустимо: audio, video; unified — только ядро 2.5.0+" }));
+    }
+    if modern {
+        let srtp = g("srtp_mode").to_ascii_lowercase();
+        if !matches!(srtp.as_str(), "" | "auto" | "wrap" | "wrap-srtp" | "wrap_srtp" | "legacy" | "dtls" | "dtls-srtp" | "dtls_srtp") {
+            return Err(format!("srtp_mode '{}' не поддерживается (допустимо: auto, wrap, dtls)", srtp));
+        }
+    }
     push("--obfs", obfs);
     push("--turn-transport", transport);
     push("--tun-uds", uds.to_string());
@@ -1548,6 +1579,36 @@ mod tests {
         assert!(ad.contains("--domain-routing") && ad.contains("--direct-domains x.org"));
         let big = Config::parse(&CFG.replace("'12'", "'101'"));
         assert!(core_cmd(&big, &big.server("p1").unwrap(), "u", true).is_err());
+    }
+
+    #[test]
+    fn worker_groups_and_hash_coverage() {
+        assert_eq!(worker_groups(18, false), (10, 1));
+        assert_eq!(worker_groups(50, false), (50, 5));
+        assert_eq!(worker_groups(101, false), (100, 10));
+        assert_eq!(worker_groups(0, false), (10, 1));
+        assert_eq!(worker_groups(7, true), (7, 1));
+        assert_eq!(worker_groups(2, true), (3, 1));
+        // 5 хешей и 18 воркеров (=10) → задействован только 1 хеш
+        let cfg = Config::parse(&CFG.replace("option vk 'h1,h2'", "option vk 'a,b,c,d,e'").replace("option workers '12'", "option workers '18'"));
+        assert_eq!(hash_coverage(&cfg, &cfg.server("p1").unwrap()), Some((10, 1, 5)));
+        let ok = Config::parse(&CFG.replace("option vk 'h1,h2'", "option vk 'a,b,c,d,e'").replace("option workers '12'", "option workers '50'"));
+        assert_eq!(hash_coverage(&ok, &ok.server("p1").unwrap()), None);
+    }
+
+    #[test]
+    fn rejects_unsupported_values() {
+        let uni = Config::parse(&CFG.replace("option workers '12'", "option workers '12'\n\toption obfs 'unified'"));
+        // unified: нормально для 2.5.0+, отказ для 2.1.x
+        assert!(core_cmd(&uni, &uni.server("p1").unwrap(), "u", true).is_ok());
+        let e = core_cmd(&uni, &uni.server("p1").unwrap(), "u", false).unwrap_err();
+        assert!(e.contains("unified") && e.contains("2.5.0"), "{}", e);
+        let bad = Config::parse(&CFG.replace("option workers '12'", "option workers '12'\n\toption obfs 'xyz'"));
+        assert!(core_cmd(&bad, &bad.server("p1").unwrap(), "u", true).is_err());
+        let srtp = Config::parse(&CFG.replace("option workers '12'", "option workers '12'\n\toption srtp_mode 'dtls-srtp'"));
+        assert!(core_cmd(&srtp, &srtp.server("p1").unwrap(), "u", true).is_ok());
+        let nosrtp = Config::parse(&CFG.replace("option workers '12'", "option workers '12'\n\toption srtp_mode 'quic'"));
+        assert!(core_cmd(&nosrtp, &nosrtp.server("p1").unwrap(), "u", true).unwrap_err().contains("srtp_mode"));
     }
 
     #[test]

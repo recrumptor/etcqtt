@@ -1,5 +1,5 @@
 //! `csqtt doctor`: read-only диагностика. Код выхода: 0 — всё ок, 1 — WARN, 2 — FAIL.
-use crate::supervisor::{core_args, core_bin, core_modern, core_version, routing_active, Settings};
+use crate::supervisor::{core_args, core_bin, core_modern, core_version, hash_coverage, routing_active, Settings};
 use crate::uci::Config;
 use crate::{tun, util};
 use serde_json::{json, Value};
@@ -81,6 +81,13 @@ pub fn run_checks(config: &str, status_path: &str, helper_port: u16) -> Vec<Chec
         for s in &enabled {
             if routing_active(&cfg, s) {
                 out.push(c_("routing", "warn", format!("{}: включена маршрутизация по доменам/IP — пользовательский сетевой стек ядра заметно нагружает CPU и ОЗУ слабых роутеров", s.name)));
+            }
+        }
+    }
+    if core_modern() {
+        for s in &enabled {
+            if let Some((w, groups, hashes)) = hash_coverage(&cfg, s) {
+                out.push(c_("workers", "warn", format!("{}: воркеров {} ({} групп) при {} хешах — используются только первые {} хеша(ей); для всех нужно workers ≥ {}", s.name, w, groups, hashes, groups, hashes * 10)));
             }
         }
     }

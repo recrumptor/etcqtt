@@ -107,6 +107,24 @@ pub fn import_with(config: &str, raw: &str, o: &ImportOpts, modern: bool) -> Res
             notes.push(format!("в ссылке {} хеш(ей); общие хеши уже заданы — используйте --vk-to-shared для замены", l.hashes.len()));
         }
     }
+    if l.hashes.len() > 6 {
+        notes.push(format!("в ссылке {} хешей: ядро использует только первые 6", l.hashes.len()));
+    }
+    if !l.token.is_empty() {
+        let main = cfg.main();
+        if o.vk_to_shared || main.get("vk_js_token").trim().is_empty() {
+            if o.commit {
+                cfg.set_option("main", "vk_hash_mode", "auto_js");
+                cfg.set_option("main", "vk_js_token", &l.token);
+            }
+            notes.push("в ссылке VK-токен вместо хешей: включён режим vk_hash_mode=auto_js, токен записан в общие настройки".into());
+        } else {
+            notes.push("в ссылке VK-токен, но общий токен уже задан — используйте --vk-to-shared для замены".into());
+        }
+    }
+    if l.password.is_empty() {
+        notes.push(format!("в ссылке нет пароля (ссылка владельца) — задайте его: uci set csqtt.{}.password='…' && uci commit csqtt", id));
+    }
     // device_id привязан к паролю на сервере: создаём один раз и дальше не меняем
     if !modern && cfg.shared(&cfg.main(), "device_id").is_empty() {
         let dev = util::uuid_v4();
@@ -133,7 +151,12 @@ pub fn import_with(config: &str, raw: &str, o: &ImportOpts, modern: bool) -> Res
     Ok(format!("импортирован: {}", msg))
 }
 
+/// Ссылка профиля: ядро 2.5.0+ — зашифрованный формат, иначе прежний открытый.
 pub fn export(config: &str, id: &str) -> Result<String, String> {
+    export_with(config, id, crate::supervisor::core_modern())
+}
+
+pub fn export_with(config: &str, id: &str, encrypted: bool) -> Result<String, String> {
     if !id_ok(id) {
         return Err("некорректный id профиля".into());
     }
@@ -141,16 +164,24 @@ pub fn export(config: &str, id: &str) -> Result<String, String> {
     let s = cfg.server(id).ok_or_else(|| format!("профиль '{}' не найден", id))?;
     let peer = s.get("peer").to_string();
     let (host, port) = peer.rsplit_once(':').ok_or("peer без порта")?;
+    let mut hashes: Vec<String> = crate::supervisor::normalize_hashes(&cfg.shared(&s, "vk")).split(',').filter(|x| !x.is_empty()).map(String::from).collect();
+    // режим auto_js: вместо хешей в ссылке токен (хеши и токен в ссылке взаимоисключающи)
+    let mut token = String::new();
+    if cfg.shared(&s, "vk_hash_mode") == "auto_js" && !cfg.shared(&s, "vk_js_token").is_empty() {
+        token = cfg.shared(&s, "vk_js_token");
+        hashes.clear();
+    }
     let l = link::Link {
         host: host.trim_matches(|c| c == '[' || c == ']').to_string(),
         port: port.parse().map_err(|_| "некорректный порт peer")?,
         password: s.get("password").to_string(),
-        hashes: crate::supervisor::normalize_hashes(&cfg.shared(&s, "vk")).split(',').filter(|x| !x.is_empty()).map(String::from).collect(),
+        hashes,
+        token,
     };
     if l.password.is_empty() {
         return Err("у профиля нет пароля".into());
     }
-    Ok(link::export(&l))
+    Ok(link::export(&l, encrypted))
 }
 
 #[cfg(test)]
@@ -179,7 +210,12 @@ mod tests {
         assert_eq!(c.main().get("active_profile"), "profile1");
         assert_eq!(c.main().get("selection_mode"), "manual");
         assert_eq!(c.main().get("device_id").len(), 36);
-        assert_eq!(export(&p, "profile1").unwrap(), "csqtt://connect?v=2&host=h.example&peer=46000&password=s3&hashes=a%2Bb".replace("%2B", "+"));
+        assert_eq!(export_with(&p, "profile1", false).unwrap(), "csqtt://connect?v=2&host=h.example&peer=46000&password=s3&hashes=a%2Bb".replace("%2B", "+"));
+        // 2.5.0+: зашифрованная ссылка, которую разбирает и наш parse, и приложение/сервер
+        let enc = export_with(&p, "profile1", true).unwrap();
+        assert!(enc.starts_with("csqtt://") && !enc.contains("h.example") && !enc.contains("connect"));
+        let back = link::parse(&enc).unwrap();
+        assert_eq!((back.host.as_str(), back.port, back.password.as_str(), back.hashes.clone()), ("h.example", 46000, "s3", vec!["a".to_string(), "b".to_string()]));
         action(&p, "disable", Some("profile1")).unwrap();
         assert_eq!(Config::load(&p).unwrap().server("profile1").unwrap().get("enabled"), "0");
         assert_eq!(Config::load(&p).unwrap().main().get("active_profile"), "");
@@ -197,6 +233,39 @@ mod tests {
         let msg = import_with(&p, "csqtt://connect?v=2&host=h.example&peer=46000&password=s3&hashes=a", &o, true).unwrap();
         assert!(!msg.contains("device_id"));
         assert_eq!(Config::load(&p).unwrap().main().get("device_id"), "");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn import_encrypted_link_and_token_link() {
+        let p = tmp(BASE);
+        let o = ImportOpts { id: None, name: None, activate: false, vk_to_shared: false, commit: true };
+        let enc = link::export(&link::Link { host: "enc.example".into(), port: 40001, password: "pw1".into(), hashes: vec!["hashAAAAAAAAAAAAAAAA".into()], token: String::new() }, true);
+        import_with(&p, &enc, &o, true).unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.server("profile1").unwrap().get("peer"), "enc.example:40001");
+        assert_eq!(c.main().get("vk"), "hashAAAAAAAAAAAAAAAA");
+        // ссылка с токеном → режим auto_js
+        let tok = link::export(&link::Link { host: "tok.example".into(), port: 40002, password: "pw2".into(), hashes: vec![], token: "vk1.a.TOKEN".into() }, true);
+        import_with(&p, &tok, &o, true).unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.main().get("vk_hash_mode"), "auto_js");
+        assert_eq!(c.main().get("vk_js_token"), "vk1.a.TOKEN");
+        // экспорт профиля при auto_js отдаёт токен
+        let out = export_with(&p, "profile2", true).unwrap();
+        assert_eq!(link::parse(&out).unwrap().token, "vk1.a.TOKEN");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn owner_link_without_password_is_imported_with_a_note() {
+        let p = tmp(BASE);
+        let o = ImportOpts { id: None, name: None, activate: false, vk_to_shared: false, commit: true };
+        let owner = format!("csqtt://{}", link::encrypt_payload("connect?v=2&host=203.0.113.7&peer=46000").unwrap());
+        let msg = import_with(&p, &owner, &o, true).unwrap();
+        assert!(msg.contains("нет пароля"));
+        assert_eq!(Config::load(&p).unwrap().server("profile1").unwrap().get("password"), "");
+        assert!(export_with(&p, "profile1", true).is_err());
         std::fs::remove_file(p).ok();
     }
 }

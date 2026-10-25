@@ -189,8 +189,17 @@ try:
     r = subprocess.run([BIN, "--validate-vk-hashes", "--vk-file", vf, "--config", cfgp], capture_output=True, text=True, env=env)
     lines = [l for l in r.stdout.splitlines() if l.startswith("HASH_CHECK:")]
     check(len(lines) == 2 and '"valid"' in lines[0] and '"invalid"' in lines[1], "--validate-vk-hashes проксирует вывод ядра")
-    r = subprocess.run([BIN, "profile", "export", "p1", "--config", cfgp], capture_output=True, text=True)
-    check(r.stdout.startswith("csqtt://connect?v=2&host=captcha1.example&peer=46000"), "profile export")
+    r = subprocess.run([BIN, "profile", "export", "p1", "--config", cfgp], capture_output=True, text=True, env=env)
+    link = r.stdout.strip()
+    if MODE == "legacy":
+        check(link.startswith("csqtt://connect?v=2&host=captcha1.example&peer=46000"), "profile export: открытая ссылка (ядро 2.1.x)")
+    else:
+        check(link.startswith("csqtt://") and "connect" not in link and "captcha1.example" not in link, "profile export: зашифрованная ссылка (ядро 2.5.0+)")
+    # ссылка читается обратно (dry-run импорта печатает адрес сервера)
+    r = subprocess.run([BIN, "profile", "import", link, "--config", f"{d}/import-check"], capture_output=True, text=True, env=env)
+    open(f"{d}/import-check", "a").close()
+    r = subprocess.run([BIN, "profile", "import", link, "--config", f"{d}/import-check"], capture_output=True, text=True, env=env)
+    check("captcha1.example:46000" in r.stdout, f"экспортированная ссылка импортируется обратно: {r.stdout.strip()[:60]}")
 
     # ---- 5b. потеря TUN (код 3): интерфейс пересоздаётся, профиль не штрафуется и не переключается
     write_cfg(profiles=[("p1", 10, "tunlost1.example:46000")])

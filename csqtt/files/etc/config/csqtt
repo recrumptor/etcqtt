@@ -28,7 +28,7 @@ config csqtt 'main'
 	option health_target ''
 	option captcha_policy 'failover'
 	option tun_address ''
-	option tun_mtu '1280'
+	option tun_mtu '1280'   # безопасное значение; у приложения 2.5.0 по умолчанию 1500 (было 1300) — можно поднять и проверить
 	option dns ''
 	option log_level 'info'
 	option log_file '/var/log/csqtt.log'
@@ -38,7 +38,8 @@ config csqtt 'main'
 	# option obfs 'unified'            # audio | video | unified (по умолчанию unified; у 2.1.x — audio)
 	# option turn_transport 'udp'      # udp | tcp
 	# option srtp_mode 'auto'          # auto | wrap | dtls
-	# option workers '30'              # 1..100; ядро округляет до групп по 10 (если не exact_workers)
+	# option workers '50'              # ядро 2.5.0+: округляется вниз до десятков (10..100); группа = 10 воркеров и берёт хеш по кругу,
+	#                                  # поэтому при 5 хешах нужно workers >= 50, иначе часть хешей не используется
 	# option exact_workers '0'         # 1 = ровно столько воркеров, без округления
 	# option runtime_threads '0'       # потоки рантайма ядра; 0 = авто
 	# option custom_turn_ips ''        # свои TURN-адреса: "1.2.3.4,5.6.7.8"
