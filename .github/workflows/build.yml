@@ -49,6 +49,7 @@ jobs:
           sudo modprobe tun || true
           sudo test -c /dev/net/tun
           sudo env CORE_MODE=modern python3 tests/integration.py   # ядро 2.5.0+: пароль через окружение
+          sudo env CORE_MODE=modern FAKE_SERVER_LIMIT=40 python3 tests/integration.py   # сервер сообщает лимит воркеров
           sudo env CORE_MODE=legacy python3 tests/integration.py   # ядро 2.1.x: аргументы --password/--device-id
 
   check-version:

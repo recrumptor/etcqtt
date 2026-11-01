@@ -86,7 +86,8 @@ def check(cond, msg):
 FAKE = f"{d}/fake_core.py"
 shutil.copyfile(f"{HERE}/fake_core.py", FAKE)
 os.chmod(FAKE, 0o755)
-env = dict(os.environ, CSQTT_CORE=FAKE, FAKE_LOG=flog, TUN_NAME="csqtt_it0", FAKE_MODE=MODE, FAKE_MARK=MARK,
+SERVER_LIMIT = int(os.environ.get("FAKE_SERVER_LIMIT", "0"))   # 0 = сервер лимит не указал (как у пользователя: было «10 / 0»)
+env = dict(os.environ, CSQTT_CORE=FAKE, FAKE_LOG=flog, TUN_NAME="csqtt_it0", FAKE_MODE=MODE, FAKE_MARK=MARK, FAKE_SERVER_LIMIT=str(SERVER_LIMIT),
            CSQTT_CORE_VERSION="2.5.0" if MODE == "modern" else "2.1.9")
 print(f"== режим ядра: {MODE} ==")
 proc = None
@@ -115,8 +116,11 @@ try:
     time.sleep(6)
     s = status()
     check(s["connected"] and s["active_profile"] == "p1" and s["reconnects"] == 0, "неудачная проба по умолчанию НЕ вызывает failover")
-    want_workers = 10 if MODE == "modern" else 6   # 2.5.0: число воркеров сообщает ядро (событие WORKERS)
-    check(s["workers"]["configured"] == want_workers, f"workers.configured = {want_workers}")
+    # в конфиге workers = 6: ядро 2.5.0 округляет до группы из 10, старое оставляет как есть
+    want_workers = 10 if MODE == "modern" else 6
+    check(s["workers"]["configured"] == want_workers and s["workers"]["requested"] == 6, f"workers: запрошено 6, эффективно {want_workers}")
+    check(s["workers"]["server_limit"] == (SERVER_LIMIT or None), f"событие WORKERS = лимит сервера, не «настроено»: server_limit={SERVER_LIMIT or None}")
+    check(s["core"]["modern"] == (MODE == "modern") and s["core"]["version"] == ("2.5.0" if MODE == "modern" else "2.1.9"), "status.json: сведения о ядре (версия, режим)")
     check(any(p["id"] == "p1" and p["state"] == "active" for p in s["profiles"]), "p1 в состоянии active")
     check("got tun fd, ifname_ok=True" in open(flog).read(), "ядро получило дескриптор TUN")
     lg = open(flog).read()
@@ -224,6 +228,9 @@ try:
     check(not os.path.exists("/sys/class/net/csqtt_it0"), "TUN исчез после остановки")
     r = subprocess.run([BIN, "status", "--status-path", stp], capture_output=True, text=True)
     check(r.returncode == 2, "csqtt status → 2 (не запущена)")
+    r = subprocess.run([BIN, "status", "--json", "--status-path", stp], capture_output=True, text=True, env=env)
+    js = json.loads(r.stdout)
+    check(r.returncode == 2 and js["running"] is False and js["core"]["modern"] == (MODE == "modern"), "остановленная служба тоже сообщает версию и режим ядра (нужно панели)")
     # ---- 7. tun_address пуст → назначается адрес, выданный сервером (/32), как у Android-клиента
     write_cfg(tun_address=""); start()
     s = wait(lambda s: s.get("connected") and s["tunnel"].get("client_ip"), "подключение с адресом от сервера")

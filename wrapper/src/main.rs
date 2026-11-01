@@ -130,7 +130,7 @@ fn status_cmd(a: &Args) -> i32 {
     let mut v: Value = std::fs::read_to_string(&sp).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
     if !running {
         if a.has("json") {
-            println!("{}", serde_json::json!({"running": false, "connected": false}));
+            println!("{}", serde_json::json!({"running": false, "connected": false, "version": supervisor::version_string(), "core": supervisor::core_info()}));
         } else {
             println!("служба CSQTT не запущена");
         }

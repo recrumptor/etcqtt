@@ -78,7 +78,9 @@ if "captcha" in peer:
 # как настоящее ядро: сервер выдаёт клиенту адрес туннеля (TUNCONF) до начала передачи данных
 ev("CONFIG", config="TUNCONF:10.255.88.9:1.1.1.1")
 if MODE == "modern":
-    ev("WORKERS", workers=10)   # ядро 2.5.0 само округляет число воркеров до групп по 10
+    # Событие WORKERS ядра 2.5.0 несёт server_limit — лимит воркеров на стороне СЕРВЕРА (0 = не указан),
+    # а не число воркеров клиента (его ядро само округляет до групп по 10).
+    ev("WORKERS", workers=int(os.environ.get("FAKE_SERVER_LIMIT", "0")))
 ev("READY", worker=1)
 if "tunlost" in peer:
     mark = os.environ.get("FAKE_MARK", "/tmp/fake_tunlost.mark")

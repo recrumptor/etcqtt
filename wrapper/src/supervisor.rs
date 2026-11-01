@@ -166,19 +166,44 @@ pub fn effective_settings(cfg: &Config, prof: &Section) -> (String, String) {
     effective_settings_for(cfg, prof, core_modern())
 }
 
-/// Воркеры и группы ядра 2.5.0+: workers округляется вниз до десятков (10..100), группа = 10 воркеров;
-/// с `exact_workers` — ровно столько (3..100). Возвращает (воркеров, групп). Группа i берёт хеш i % число_хешей.
+/// Воркеры и группы ядра 2.5.0+ (как `normalize_worker_count` в ядре): значение до 5 включительно остаётся 5,
+/// иначе округляется вниз до десятков (10..100); группа = 10 воркеров. С `exact_workers` — ровно столько (3..100).
+/// Возвращает (воркеров, групп). Группа i берёт хеш i % число_хешей.
 pub fn worker_groups(requested: usize, exact: bool) -> (usize, usize) {
     const GROUP: usize = 10;
     const MAX: usize = 100;
-    let w = if exact { requested.clamp(3, MAX) } else { requested.clamp(GROUP, MAX) / GROUP * GROUP };
+    let w = if exact {
+        requested.clamp(3, MAX)
+    } else if requested <= 5 {
+        5
+    } else {
+        requested.clamp(GROUP, MAX) / GROUP * GROUP
+    };
     (w, w.div_ceil(GROUP))
+}
+
+/// Воркеры профиля по правилам ядра: (запрошено, эффективно, групп). Для ядра ≤ 2.1.x эффективное = запрошенное, групп нет.
+pub fn workers_report(cfg: &Config, prof: &Section, modern: bool) -> (usize, usize, usize) {
+    let g = |k: &str| cfg.shared(prof, k);
+    let requested: usize = g("workers").trim().parse().unwrap_or(if modern { 10 } else { 18 });
+    if modern {
+        let (w, groups) = worker_groups(requested, truthy(&g("exact_workers")));
+        (requested, w, groups)
+    } else {
+        (requested, requested, 0)
+    }
+}
+
+/// Сведения о ядре для панели: версия (если известна) и режим (2.5.0+).
+pub fn core_info() -> Value {
+    let ver = std::env::var("CSQTT_CORE_VERSION").ok().or_else(|| if CORE_VERSION == "unknown" { None } else { Some(CORE_VERSION.to_string()) });
+    json!({"version": ver, "modern": core_modern()})
 }
 
 /// Профили, у которых групп воркеров меньше, чем хешей: лишние хеши не используются (ядро 2.5.0+).
 pub fn hash_coverage(cfg: &Config, prof: &Section) -> Option<(usize, usize, usize)> {
     let g = |k: &str| cfg.shared(prof, k);
-    let requested: usize = if g("workers").is_empty() { 18 } else { g("workers").parse().ok()? };
+    let requested: usize = if g("workers").is_empty() { 10 } else { g("workers").parse().ok()? };
     let hashes = normalize_hashes(&g("vk")).split(',').filter(|x| !x.is_empty()).count().min(6);
     if hashes == 0 {
         return None;
@@ -232,10 +257,12 @@ pub fn core_cmd(cfg: &Config, prof: &Section, uds: &str, modern: bool) -> Result
         return Err("режим auto_js требует vk_js_token".into());
     }
     let or = |v: String, d: &str| if v.is_empty() { d.to_string() } else { v };
-    let workers = or(g("workers"), "18");
-    // у ядра MAX_WORKERS = 100; ядро само округляет до групп по 10 (если не задан exact_workers)
-    if workers.parse::<usize>().map(|n| n == 0 || n > 100).unwrap_or(true) {
-        return Err("workers: ожидается 1..100".into());
+    // ядро 2.5.0+: по умолчанию 10 (его собственные 18 всё равно округляются до 10), максимум 100;
+    // ядро ≤ 2.1.x: по умолчанию 18, максимум 126
+    let workers = or(g("workers"), if modern { "10" } else { "18" });
+    let max_workers: usize = if modern { 100 } else { 126 };
+    if workers.parse::<usize>().map(|n| n == 0 || n > max_workers).unwrap_or(true) {
+        return Err(format!("workers: ожидается 1..{}", max_workers));
     }
     let mut a: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
@@ -392,7 +419,7 @@ struct Session {
     tun_deadline: Instant,
     client_ip: Option<std::net::Ipv4Addr>,
     dns: String,
-    workers_total: Option<u32>,
+    server_limit: Option<u32>,
     tun_lost: bool,
     routing: Option<Value>,
 }
@@ -721,7 +748,7 @@ impl Sup {
             tun_deadline: now + Duration::from_secs(15),
             client_ip: None,
             dns: String::new(),
-            workers_total: None,
+            server_limit: None,
             tun_lost: false,
             routing: None,
         });
@@ -912,8 +939,11 @@ impl Sup {
                         }
                     }
                     "WORKERS" => {
-                        s.workers_total = data["workers"].as_u64().map(|n| n as u32);
-                        logd!("ядро: воркеров {}", data["workers"]);
+                        // payload {"workers": N} — это лимит воркеров на стороне СЕРВЕРА (server_limit из TUNWORKERS),
+                        // 0 = лимит не указан. Это не число настроенных воркеров.
+                        let n = data["workers"].as_u64().unwrap_or(0) as u32;
+                        s.server_limit = if n > 0 { Some(n) } else { None };
+                        logd!("ядро: лимит воркеров сервера {}", data["workers"]);
                     }
                     "TUN_LOST" => {
                         s.tun_lost = true;
@@ -1285,14 +1315,16 @@ impl Sup {
             Some(s) => (self.total_up + s.up, self.total_down + s.down),
             None => (self.total_up, self.total_down),
         };
-        let configured_workers = self
+        // воркеры профиля (активного, а без сессии — того, что был бы выбран) по правилам ядра
+        let workers_profile = if !active_profile.is_empty() { active_profile.clone() } else { self.pick(true).unwrap_or_default() };
+        let (requested_workers, configured_workers, worker_groups_n) = self
             .pool
             .iter()
-            .find(|p| p.id == active_profile)
+            .find(|p| p.id == workers_profile)
             .and_then(|p| self.cfg.server(&p.id))
-            .map(|sec| self.cfg.shared(&sec, "workers").parse::<i64>().unwrap_or(18))
-            .unwrap_or(0);
-        let configured_workers = self.sess.as_ref().and_then(|s| s.workers_total).map(|n| n as i64).unwrap_or(configured_workers);
+            .map(|sec| workers_report(&self.cfg, &sec, core_modern()))
+            .unwrap_or((0, 0, 0));
+        let server_limit = self.sess.as_ref().and_then(|s| s.server_limit);
         let profiles: Vec<Value> = self
             .pool
             .iter()
@@ -1303,6 +1335,7 @@ impl Sup {
             "schema": 1,
             "pid": pid,
             "version": version_string(),
+            "core": core_info(),
             "generated_at": now,
             "started_at": self.started_at,
             "running": true,
@@ -1318,7 +1351,8 @@ impl Sup {
             "tx_bytes": up,
             "rx_bytes": down,
             "reconnects": self.reconnects,
-            "workers": {"active": workers_active, "configured": configured_workers},
+            "workers": {"active": workers_active, "configured": configured_workers, "requested": requested_workers,
+                         "groups": worker_groups_n, "server_limit": server_limit},
             "resources": {"process_rss_kb": rss, "process_cpu_percent": self.cpu_pct},
             "switch_history": self.history.iter().rev().cloned().collect::<Vec<_>>(),
             "profiles": profiles,
@@ -1586,7 +1620,10 @@ mod tests {
         assert_eq!(worker_groups(18, false), (10, 1));
         assert_eq!(worker_groups(50, false), (50, 5));
         assert_eq!(worker_groups(101, false), (100, 10));
-        assert_eq!(worker_groups(0, false), (10, 1));
+        // как normalize_worker_count в ядре: всё до 5 включительно (даже 0) даёт 5
+        assert_eq!(worker_groups(0, false), (5, 1));
+        assert_eq!(worker_groups(5, false), (5, 1));
+        assert_eq!(worker_groups(6, false), (10, 1));
         assert_eq!(worker_groups(7, true), (7, 1));
         assert_eq!(worker_groups(2, true), (3, 1));
         // 5 хешей и 18 воркеров (=10) → задействован только 1 хеш
@@ -1650,6 +1687,51 @@ mod tests {
         let t3 = t.replace("option password 'secret'", "option password 'secret'\n\toption obfs 'video'");
         let cfg3 = Config::parse(&t3);
         assert_eq!(effective_settings_for(&cfg3, &cfg3.server("p1").unwrap(), true), ("tcp".to_string(), "video".to_string()));
+    }
+
+    #[test]
+    fn worker_rules_match_core() {
+        // normalize_worker_count ядра 2.5.0: <=5 -> 5, иначе вниз до десятков, максимум 100
+        for (req, want) in [(1, 5), (5, 5), (6, 10), (9, 10), (10, 10), (18, 10), (19, 10), (20, 20), (55, 50), (99, 90), (100, 100), (150, 100)] {
+            assert_eq!(worker_groups(req, false).0, want, "workers={}", req);
+        }
+        assert_eq!(worker_groups(18, false), (10, 1));
+        assert_eq!(worker_groups(50, false), (50, 5));
+        // exact_workers: ровно столько, 3..100
+        assert_eq!((worker_groups(2, true).0, worker_groups(18, true), worker_groups(500, true).0), (3, (18, 2), 100));
+    }
+
+    #[test]
+    fn workers_report_uses_core_rules() {
+        let cfg = Config::parse(CFG); // в CFG workers = 12
+        let sec = cfg.server("p1").unwrap();
+        assert_eq!(workers_report(&cfg, &sec, true), (12, 10, 1));
+        assert_eq!(workers_report(&cfg, &sec, false), (12, 12, 0));
+        // не задано: 10 для 2.5.0+, 18 для старых
+        let none = Config::parse(&CFG.replace("\toption workers '12'\n", ""));
+        assert_eq!(workers_report(&none, &none.server("p1").unwrap(), true), (10, 10, 1));
+        assert_eq!(workers_report(&none, &none.server("p1").unwrap(), false), (18, 18, 0));
+        let ex = Config::parse(&CFG.replace("option workers '12'", "option workers '18'\n\toption exact_workers '1'"));
+        assert_eq!(workers_report(&ex, &ex.server("p1").unwrap(), true), (18, 18, 2));
+    }
+
+    #[test]
+    fn workers_limits_depend_on_core() {
+        let none = Config::parse(&CFG.replace("\toption workers '12'\n", ""));
+        let a_new = core_cmd(&none, &none.server("p1").unwrap(), "u", true).unwrap().args.join(" ");
+        let a_old = core_cmd(&none, &none.server("p1").unwrap(), "u", false).unwrap().args.join(" ");
+        assert!(a_new.contains("-n 10 ") && a_old.contains("-n 18 "), "{} | {}", a_new, a_old);
+        let big = Config::parse(&CFG.replace("'12'", "'120'"));
+        assert!(core_cmd(&big, &big.server("p1").unwrap(), "u", true).is_err());
+        assert!(core_cmd(&big, &big.server("p1").unwrap(), "u", false).is_ok(), "старое ядро допускает до 126");
+        let too = Config::parse(&CFG.replace("'12'", "'127'"));
+        assert!(core_cmd(&too, &too.server("p1").unwrap(), "u", false).is_err());
+    }
+
+    #[test]
+    fn core_info_shape() {
+        let v = core_info();
+        assert!(v["modern"].is_boolean() && (v["version"].is_string() || v["version"].is_null()));
     }
 
     #[test]
