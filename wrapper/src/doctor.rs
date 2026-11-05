@@ -87,7 +87,7 @@ pub fn run_checks(config: &str, status_path: &str, helper_port: u16) -> Vec<Chec
     if core_modern() {
         for s in &enabled {
             if let Some((w, groups, hashes)) = hash_coverage(&cfg, s) {
-                out.push(c_("workers", "warn", format!("{}: воркеров {} ({} групп) при {} хешах — используются только первые {} хеша(ей); для всех нужно workers ≥ {}", s.name, w, groups, hashes, groups, hashes * 10)));
+                out.push(c_("workers", "warn", workers_warning(&s.name, w, groups, hashes)));
             }
         }
     }
@@ -123,6 +123,37 @@ pub fn run_checks(config: &str, status_path: &str, helper_port: u16) -> Vec<Chec
     out
 }
 
+/// Русское склонение: 1 хеш, 2–4 хеша, 5+ хешей (11–14 — «хешей»).
+fn plural(n: usize, one: &str, few: &str, many: &str) -> String {
+    let (n10, n100) = (n % 10, n % 100);
+    let form = if n10 == 1 && n100 != 11 {
+        one
+    } else if (2..=4).contains(&n10) && !(12..=14).contains(&n100) {
+        few
+    } else {
+        many
+    };
+    format!("{} {}", n, form)
+}
+
+/// Предупреждение «хешей больше, чем групп воркеров». Группа из 10 воркеров привязана к одному хешу
+/// (номер группы mod число хешей), остальные хеши не используются.
+pub fn workers_warning(name: &str, workers: usize, groups: usize, hashes: usize) -> String {
+    let at = if hashes % 10 == 1 && hashes % 100 != 11 { format!("{} хеше", hashes) } else { format!("{} хешах", hashes) };
+    let verb = if groups % 10 == 1 && groups % 100 != 11 { "используется" } else { "используются" };
+    format!(
+        "{}: {} ({}) при {} — {} только {} из {}; чтобы работали все, задайте workers ≥ {} или оставьте в списке только нужные хеши",
+        name,
+        plural(workers, "воркер", "воркера", "воркеров"),
+        plural(groups, "группа", "группы", "групп"),
+        at,
+        verb,
+        plural(groups, "хеш", "хеша", "хешей"),
+        hashes,
+        hashes * 10
+    )
+}
+
 pub fn status_running(status_path: &str) -> bool {
     let Ok(t) = std::fs::read_to_string(status_path) else { return false };
     let Ok(v) = serde_json::from_str::<Value>(&t) else { return false };
@@ -150,5 +181,34 @@ pub fn to_json(checks: &[Check]) -> Value {
 pub fn print_text(checks: &[Check]) {
     for c in checks {
         println!("[{:<4}] {} — {}", c.status.to_uppercase(), c.name, c.message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plurals() {
+        assert_eq!(plural(1, "хеш", "хеша", "хешей"), "1 хеш");
+        assert_eq!(plural(2, "хеш", "хеша", "хешей"), "2 хеша");
+        assert_eq!(plural(5, "хеш", "хеша", "хешей"), "5 хешей");
+        assert_eq!(plural(11, "хеш", "хеша", "хешей"), "11 хешей");
+        assert_eq!(plural(21, "хеш", "хеша", "хешей"), "21 хеш");
+        assert_eq!(plural(14, "группа", "группы", "групп"), "14 групп");
+    }
+
+    #[test]
+    fn workers_warning_text() {
+        // случай со скриншота: 10 воркеров = 1 группа, 5 хешей
+        assert_eq!(
+            workers_warning("profile1", 10, 1, 5),
+            "profile1: 10 воркеров (1 группа) при 5 хешах — используется только 1 хеш из 5; чтобы работали все, задайте workers ≥ 50 или оставьте в списке только нужные хеши"
+        );
+        let w = workers_warning("p", 20, 2, 5);
+        assert!(w.contains("20 воркеров (2 группы)") && w.contains("используются только 2 хеша из 5") && w.contains("workers ≥ 50"), "{}", w);
+        let w = workers_warning("p", 30, 3, 6);
+        assert!(w.contains("при 6 хешах") && w.contains("3 хеша из 6") && w.contains("workers ≥ 60"), "{}", w);
+        assert!(workers_warning("p", 10, 1, 2).contains("при 2 хешах — используется только 1 хеш из 2"));
     }
 }

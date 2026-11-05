@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "csqtt-ctl"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "aws-lc-rs",
  "libc",

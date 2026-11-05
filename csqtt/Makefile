@@ -9,7 +9,7 @@ PKG_NAME:=csqtt
 # PKG_VERSION — версия ядра upstream (CI подставляет автоматически); PKG_RELEASE — ревизия
 # обёртки/упаковки: увеличивайте при любых изменениях в wrapper/ или в файлах пакета.
 PKG_VERSION:=2.1.9
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_LICENSE:=PolyForm-Noncommercial-1.0.0
 PKG_MAINTAINER:=csqtt-openwrt contributors
