@@ -327,6 +327,9 @@ jobs:
           - { openwrt_ver: "24.10", pkg_ext: ipk, pkg_arch: mipsel_24kc,        target_name: "ramips/mt7621",    rust_target: mipsel-unknown-linux-musl,        experimental: true }
           - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: x86_64,            target_name: "x86/64",            rust_target: x86_64-unknown-linux-musl,        experimental: false }
           - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: aarch64_cortex-a53, target_name: "mediatek/filogic", rust_target: aarch64-unknown-linux-musl,       experimental: false }
+          # aarch64_generic (SDK armsr/armv8): устройства с таким пакетным архом, например модемы на MSM8916 (hmuf02v5).
+          # Бинарники те же (aarch64-unknown-linux-musl); отличается только имя архитектуры пакета.
+          - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: aarch64_generic,    target_name: "armsr/armv8",      rust_target: aarch64-unknown-linux-musl,       experimental: true }
           - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: arm_cortex-a7_neon-vfpv4, target_name: "ipq40xx/generic", rust_target: armv7-unknown-linux-musleabihf, experimental: true }
           - { openwrt_ver: "25.12", pkg_ext: apk, pkg_arch: mipsel_24kc,        target_name: "ramips/mt7621",    rust_target: mipsel-unknown-linux-musl,        experimental: true }
     steps:
